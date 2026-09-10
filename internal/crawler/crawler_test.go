@@ -345,6 +345,140 @@ func TestSyncReportsFailedDetailsSeparatelyFromAcceptedItems(t *testing.T) {
 	}
 }
 
+func TestSyncUsesCacheAwareRefreshPolicyAndForceRefresh(t *testing.T) {
+	now := time.Now()
+	dateToday := now.Format("2006-01-02")
+	dateRecent := now.AddDate(0, 0, -1).Format("2006-01-02")
+	dateStable := now.AddDate(0, 0, -30).Format("2006-01-02")
+	list := listPage(
+		listEntryHTML("301", dateToday),
+		listEntryHTML("302", dateRecent),
+		listEntryHTML("303", dateStable),
+	)
+	dates := map[string]string{"301": dateToday, "302": dateRecent, "303": dateStable}
+	var detailRequests []string
+	client := New(Config{BaseURL: "http://example.test", Delay: time.Nanosecond, MaxPages: 1, RefreshWindow: 7 * 24 * time.Hour})
+	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/campus/index/" {
+			return responseFor(req, list), nil
+		}
+		id := strings.TrimPrefix(req.URL.Path, "/campus/view/id/")
+		detailRequests = append(detailRequests, id)
+		return responseFor(req, detailPage(id, dates[id])), nil
+	})
+
+	stable := model.Announcement{ID: "303", PublishedDate: dateStable, LastSeenAt: now}
+	recent := model.Announcement{ID: "302", PublishedDate: dateRecent, LastSeenAt: now.Add(-8 * 24 * time.Hour)}
+	var firstSummary ProgressEvent
+	first, err := client.SyncProgress(context.Background(), SyncRequest{
+		StartDate:           dateStable,
+		EndDate:             dateToday,
+		CachedAnnouncements: []model.Announcement{stable, recent},
+	}, func(event ProgressEvent) error {
+		if event.Phase == "done" {
+			firstSummary = event
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(detailRequests, ",") != "301,302" {
+		t.Fatalf("first detail requests=%v", detailRequests)
+	}
+	if len(first) != 2 || first[0].PublishedDate != dateToday || first[1].PublishedDate != dateRecent {
+		t.Fatalf("first items=%#v", first)
+	}
+	if firstSummary.NewIDs != 1 || firstSummary.RefreshedIDs != 1 || firstSummary.SkippedCachedIDs != 1 {
+		t.Fatalf("first refresh counters=%+v", firstSummary)
+	}
+
+	detailRequests = nil
+	allCached := []model.Announcement{
+		{ID: "301", PublishedDate: dateToday, LastSeenAt: now},
+		{ID: "302", PublishedDate: dateRecent, LastSeenAt: now},
+		{ID: "303", PublishedDate: dateStable, LastSeenAt: now},
+	}
+	var secondSummary ProgressEvent
+	second, err := client.SyncProgress(context.Background(), SyncRequest{
+		StartDate:           dateStable,
+		EndDate:             dateToday,
+		CachedAnnouncements: allCached,
+	}, func(event ProgressEvent) error {
+		if event.Phase == "done" {
+			secondSummary = event
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detailRequests) != 0 || len(second) != 0 {
+		t.Fatalf("unchanged cache was refetched: requests=%v items=%#v", detailRequests, second)
+	}
+	if secondSummary.NewIDs != 0 || secondSummary.RefreshedIDs != 0 || secondSummary.SkippedCachedIDs != 3 {
+		t.Fatalf("second refresh counters=%+v", secondSummary)
+	}
+
+	detailRequests = nil
+	var forcedSummary ProgressEvent
+	forced, err := client.SyncProgress(context.Background(), SyncRequest{
+		StartDate:           dateStable,
+		EndDate:             dateToday,
+		CachedAnnouncements: allCached,
+		ForceRefresh:        true,
+	}, func(event ProgressEvent) error {
+		if event.Phase == "done" {
+			forcedSummary = event
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(detailRequests, ",") != "301,302,303" || len(forced) != 3 {
+		t.Fatalf("force refresh requests=%v items=%d", detailRequests, len(forced))
+	}
+	if forcedSummary.NewIDs != 0 || forcedSummary.RefreshedIDs != 3 || forcedSummary.SkippedCachedIDs != 0 {
+		t.Fatalf("force refresh counters=%+v", forcedSummary)
+	}
+	for _, item := range forced {
+		if item.PublishedDate != dates[item.ID] {
+			t.Fatalf("refresh changed source publication date: %#v", item)
+		}
+		if !item.FirstSeenAt.IsZero() || !item.LastSeenAt.IsZero() {
+			t.Fatalf("crawler fabricated cache timestamps: %#v", item)
+		}
+	}
+}
+
+func TestRefreshPreservesCachedPublicationDateWhenDetailOmitsIt(t *testing.T) {
+	now := time.Now()
+	date := now.AddDate(0, 0, -1).Format("2006-01-02")
+	client := New(Config{BaseURL: "http://example.test", Delay: time.Nanosecond, MaxPages: 1})
+	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/campus/index/" {
+			return responseFor(req, listPage(listEntryHTML("401", ""))), nil
+		}
+		return responseFor(req, detailPage("401", "")), nil
+	})
+	items, err := client.Sync(context.Background(), SyncRequest{
+		StartDate: date,
+		EndDate:   date,
+		CachedAnnouncements: []model.Announcement{{
+			ID:            "401",
+			PublishedDate: date,
+			LastSeenAt:    now.Add(-8 * 24 * time.Hour),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].PublishedDate != date {
+		t.Fatalf("cached publication date was lost: %#v", items)
+	}
+}
+
 func TestAnnouncementKeywordUsesLocalOR(t *testing.T) {
 	a := model.Announcement{Company: "测试公司", RawText: "人工智能岗位", Positions: []model.Position{{Name: "研发工程师"}}}
 	if !announcementMatchesKeyword(a, "冶金,人工智能") {

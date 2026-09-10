@@ -38,9 +38,10 @@
       <div class="section-title"><span>02</span> 增量抓取</div>
       <div class="two-col"><label>发布日期起<input type="date" name="published_since" value="{{.StartDate}}"></label><label>发布日期止<input type="date" name="published_until" value="{{.EndDate}}"></label></div>
       <label>抓取关键词<input name="keyword" value="{{.Keyword}}" placeholder="可留空"></label>
+      <label class="check"><input type="checkbox" name="force_refresh" value="1" {{if .ForceRefresh}}checked{{end}}> 强制刷新已缓存详情</label>
       <input type="hidden" name="research" value="{{.Profile.Research}}"><input type="hidden" name="skills" value="{{.Profile.Skills}}"><input type="hidden" name="degree" value="{{.Profile.Degree}}"><input type="hidden" name="graduation_year" value="{{.Profile.GraduationYear}}"><input type="hidden" name="major" value="{{.Profile.Major}}"><input type="hidden" name="cities" value="{{.Profile.Cities}}"><input type="hidden" name="roles" value="{{.Profile.Roles}}">{{if .Profile.Strict}}<input type="hidden" name="strict" value="1">{{end}}
       <button class="sync" type="submit">开始低频同步</button>
-      <p class="hint">从所选日期抓取到最新公告；默认为最近 30 天。详情页之间至少等待约 1.2 秒。</p>
+      <p class="hint">抓取包含起止日期；默认为最近 30 天至今天。详情页之间至少等待约 1.2 秒。</p>
       <div class="sync-progress" id="syncProgress" hidden aria-live="polite">
         <div class="progress-heading"><strong id="progressMessage">准备同步</strong><span id="progressCount"></span></div>
         <progress id="progressBar" value="0" max="1"></progress>

@@ -5,11 +5,15 @@ import (
 	"compress/zlib"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -229,6 +233,7 @@ func TestSyncMixedPagesAndDiscoveryCounters(t *testing.T) {
 	}
 	var pages []string
 	var details []string
+	var detailsMu sync.Mutex
 	var done ProgressEvent
 	client := New(Config{BaseURL: "http://example.test", Delay: time.Nanosecond, MaxPages: 5})
 	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -242,7 +247,9 @@ func TestSyncMixedPagesAndDiscoveryCounters(t *testing.T) {
 			return responseFor(req, body), nil
 		}
 		id := strings.TrimPrefix(req.URL.Path, "/campus/view/id/")
+		detailsMu.Lock()
 		details = append(details, id)
+		detailsMu.Unlock()
 		return responseFor(req, detailPage(id, detailDates[id])), nil
 	})
 
@@ -261,8 +268,12 @@ func TestSyncMixedPagesAndDiscoveryCounters(t *testing.T) {
 	if strings.Join(pages, ",") != ",2,3" {
 		t.Fatalf("pages=%v", pages)
 	}
-	if strings.Join(details, ",") != "100,103,101" {
-		t.Fatalf("details=%v", details)
+	detailsMu.Lock()
+	gotDetails := append([]string(nil), details...)
+	detailsMu.Unlock()
+	sort.Strings(gotDetails)
+	if strings.Join(gotDetails, ",") != "100,101,103" {
+		t.Fatalf("details=%v", gotDetails)
 	}
 	if len(items) != 3 {
 		t.Fatalf("items=%d %#v", len(items), items)
@@ -357,13 +368,16 @@ func TestSyncUsesCacheAwareRefreshPolicyAndForceRefresh(t *testing.T) {
 	)
 	dates := map[string]string{"301": dateToday, "302": dateRecent, "303": dateStable}
 	var detailRequests []string
+	var detailMu sync.Mutex
 	client := New(Config{BaseURL: "http://example.test", Delay: time.Nanosecond, MaxPages: 1, RefreshWindow: 7 * 24 * time.Hour})
 	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if req.URL.Path == "/campus/index/" {
 			return responseFor(req, list), nil
 		}
 		id := strings.TrimPrefix(req.URL.Path, "/campus/view/id/")
+		detailMu.Lock()
 		detailRequests = append(detailRequests, id)
+		detailMu.Unlock()
 		return responseFor(req, detailPage(id, dates[id])), nil
 	})
 
@@ -383,8 +397,12 @@ func TestSyncUsesCacheAwareRefreshPolicyAndForceRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(detailRequests, ",") != "301,302" {
-		t.Fatalf("first detail requests=%v", detailRequests)
+	detailMu.Lock()
+	firstRequests := append([]string(nil), detailRequests...)
+	detailMu.Unlock()
+	sort.Strings(firstRequests)
+	if strings.Join(firstRequests, ",") != "301,302" {
+		t.Fatalf("first detail requests=%v", firstRequests)
 	}
 	if len(first) != 2 || first[0].PublishedDate != dateToday || first[1].PublishedDate != dateRecent {
 		t.Fatalf("first items=%#v", first)
@@ -393,7 +411,9 @@ func TestSyncUsesCacheAwareRefreshPolicyAndForceRefresh(t *testing.T) {
 		t.Fatalf("first refresh counters=%+v", firstSummary)
 	}
 
+	detailMu.Lock()
 	detailRequests = nil
+	detailMu.Unlock()
 	allCached := []model.Announcement{
 		{ID: "301", PublishedDate: dateToday, LastSeenAt: now},
 		{ID: "302", PublishedDate: dateRecent, LastSeenAt: now},
@@ -413,14 +433,19 @@ func TestSyncUsesCacheAwareRefreshPolicyAndForceRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(detailRequests) != 0 || len(second) != 0 {
-		t.Fatalf("unchanged cache was refetched: requests=%v items=%#v", detailRequests, second)
+	detailMu.Lock()
+	secondRequestCount := len(detailRequests)
+	detailMu.Unlock()
+	if secondRequestCount != 0 || len(second) != 0 {
+		t.Fatalf("unchanged cache was refetched: requests=%d items=%#v", secondRequestCount, second)
 	}
 	if secondSummary.NewIDs != 0 || secondSummary.RefreshedIDs != 0 || secondSummary.SkippedCachedIDs != 3 {
 		t.Fatalf("second refresh counters=%+v", secondSummary)
 	}
 
+	detailMu.Lock()
 	detailRequests = nil
+	detailMu.Unlock()
 	var forcedSummary ProgressEvent
 	forced, err := client.SyncProgress(context.Background(), SyncRequest{
 		StartDate:           dateStable,
@@ -436,8 +461,12 @@ func TestSyncUsesCacheAwareRefreshPolicyAndForceRefresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(detailRequests, ",") != "301,302,303" || len(forced) != 3 {
-		t.Fatalf("force refresh requests=%v items=%d", detailRequests, len(forced))
+	detailMu.Lock()
+	forcedRequests := append([]string(nil), detailRequests...)
+	detailMu.Unlock()
+	sort.Strings(forcedRequests)
+	if strings.Join(forcedRequests, ",") != "301,302,303" || len(forced) != 3 {
+		t.Fatalf("force refresh requests=%v items=%d", forcedRequests, len(forced))
 	}
 	if forcedSummary.NewIDs != 0 || forcedSummary.RefreshedIDs != 3 || forcedSummary.SkippedCachedIDs != 0 {
 		t.Fatalf("force refresh counters=%+v", forcedSummary)
@@ -476,6 +505,152 @@ func TestRefreshPreservesCachedPublicationDateWhenDetailOmitsIt(t *testing.T) {
 	}
 	if len(items) != 1 || items[0].PublishedDate != date {
 		t.Fatalf("cached publication date was lost: %#v", items)
+	}
+}
+
+func TestNewConfiguresDetailWorkerAndConnectionBounds(t *testing.T) {
+	client := New(Config{DetailWorkers: 4, MaxConnections: 2})
+	transport, ok := client.http.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport=%T, want *http.Transport", client.http.Transport)
+	}
+	if client.cfg.DetailWorkers != 4 || client.cfg.MaxConnections != 2 {
+		t.Fatalf("config=%+v", client.cfg)
+	}
+	if transport.MaxConnsPerHost != 2 || transport.MaxIdleConnsPerHost != 2 {
+		t.Fatalf("transport connection bounds: max=%d idle=%d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
+	}
+}
+
+func TestSyncDetailsAreBoundedAndAggregatedDeterministically(t *testing.T) {
+	ids := []string{"601", "602", "603", "604", "605"}
+	dates := map[string]string{
+		"601": "2026-09-10",
+		"602": "2026-09-09",
+		"603": "2026-09-08",
+		"604": "2026-09-07",
+		"605": "2026-09-06",
+	}
+	responseDelay := map[string]time.Duration{
+		"601": 35 * time.Millisecond,
+		"602": 5 * time.Millisecond,
+		"603": 25 * time.Millisecond,
+		"604": 1 * time.Millisecond,
+		"605": 15 * time.Millisecond,
+	}
+	var active, maxActive int32
+	var requestMu sync.Mutex
+	var detailRequests []string
+	client := New(Config{
+		BaseURL:        "http://example.test",
+		Delay:          time.Nanosecond,
+		MaxPages:       1,
+		DetailWorkers:  3,
+		MaxConnections: 3,
+	})
+	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/campus/index/" {
+			entries := make([]string, 0, len(ids))
+			for _, id := range ids {
+				entries = append(entries, listEntryHTML(id, dates[id]))
+			}
+			return responseFor(req, listPage(entries...)), nil
+		}
+		id := strings.TrimPrefix(req.URL.Path, "/campus/view/id/")
+		requestMu.Lock()
+		detailRequests = append(detailRequests, id)
+		requestMu.Unlock()
+		current := atomic.AddInt32(&active, 1)
+		for {
+			previous := atomic.LoadInt32(&maxActive)
+			if current <= previous || atomic.CompareAndSwapInt32(&maxActive, previous, current) {
+				break
+			}
+		}
+		time.Sleep(responseDelay[id])
+		atomic.AddInt32(&active, -1)
+		return responseFor(req, detailPage(id, dates[id])), nil
+	})
+	items, err := client.Sync(context.Background(), SyncRequest{StartDate: "2026-09-01", EndDate: "2026-09-30"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if atomic.LoadInt32(&maxActive) < 2 || atomic.LoadInt32(&maxActive) > 3 {
+		t.Fatalf("max detail concurrency=%d", maxActive)
+	}
+	requestMu.Lock()
+	gotRequests := append([]string(nil), detailRequests...)
+	requestMu.Unlock()
+	if len(gotRequests) != len(ids) {
+		t.Fatalf("detail requests=%v", gotRequests)
+	}
+	if len(items) != len(ids) {
+		t.Fatalf("items=%d", len(items))
+	}
+	for i, item := range items {
+		if item.ID != ids[i] {
+			t.Fatalf("items[%d]=%s, want %s; items=%#v", i, item.ID, ids[i], items)
+		}
+	}
+}
+
+func TestSyncPacingIsAggregateAcrossWorkers(t *testing.T) {
+	ids := []string{"611", "612", "613"}
+	var startsMu sync.Mutex
+	var starts []time.Time
+	client := New(Config{
+		BaseURL:        "http://example.test",
+		Delay:          20 * time.Millisecond,
+		MaxPages:       1,
+		DetailWorkers:  3,
+		MaxConnections: 3,
+	})
+	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		startsMu.Lock()
+		starts = append(starts, time.Now())
+		startsMu.Unlock()
+		if req.URL.Path == "/campus/index/" {
+			return responseFor(req, listPage(
+				listEntryHTML("611", "2026-09-10"),
+				listEntryHTML("612", "2026-09-09"),
+				listEntryHTML("613", "2026-09-08"),
+			)), nil
+		}
+		id := strings.TrimPrefix(req.URL.Path, "/campus/view/id/")
+		return responseFor(req, detailPage(id, map[string]string{"611": "2026-09-10", "612": "2026-09-09", "613": "2026-09-08"}[id])), nil
+	})
+	if _, err := client.Sync(context.Background(), SyncRequest{StartDate: "2026-09-01", EndDate: "2026-09-30"}); err != nil {
+		t.Fatal(err)
+	}
+	startsMu.Lock()
+	gotStarts := append([]time.Time(nil), starts...)
+	startsMu.Unlock()
+	if len(gotStarts) != 1+len(ids) {
+		t.Fatalf("request starts=%d, want %d", len(gotStarts), 1+len(ids))
+	}
+	for i := 1; i < len(gotStarts); i++ {
+		if gap := gotStarts[i].Sub(gotStarts[i-1]); gap < 15*time.Millisecond {
+			t.Fatalf("request gap %s at index %d is below aggregate pacing", gap, i)
+		}
+	}
+}
+
+func TestFetchDetailsCancellationConverges(t *testing.T) {
+	client := New(Config{DetailWorkers: 3, Delay: time.Nanosecond})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	started := time.Now()
+	results := client.fetchDetails(ctx, []string{"621", "622", "623", "624"})
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("cancellation took too long: %s", elapsed)
+	}
+	if len(results) != 4 {
+		t.Fatalf("results=%d", len(results))
+	}
+	for _, result := range results {
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("result=%+v, want context cancellation", result)
+		}
 	}
 }
 

@@ -26,6 +26,8 @@ const defaultBaseURL = "http://job.neu.edu.cn"
 
 const defaultRefreshWindow = 7 * 24 * time.Hour
 
+const defaultDetailWorkers = 3
+
 var (
 	reDetailID = regexp.MustCompile(`(?i)/campus/view/id/(\d+)`)
 	reTag      = regexp.MustCompile(`(?is)<[^>]+>`)
@@ -45,13 +47,15 @@ var (
 )
 
 type Config struct {
-	BaseURL       string
-	UserAgent     string
-	Delay         time.Duration
-	MaxPages      int
-	HTTPTimeout   time.Duration
-	MaxRetries    int
-	RefreshWindow time.Duration
+	BaseURL        string
+	UserAgent      string
+	Delay          time.Duration
+	MaxPages       int
+	HTTPTimeout    time.Duration
+	MaxRetries     int
+	RefreshWindow  time.Duration
+	DetailWorkers  int
+	MaxConnections int
 }
 
 type SyncRequest struct {
@@ -65,7 +69,27 @@ type SyncRequest struct {
 type Client struct {
 	cfg    Config
 	http   *http.Client
+	pacer  *requestPacer
 	syncMu sync.Mutex
+}
+
+type requestPacer struct {
+	mu    sync.Mutex
+	delay time.Duration
+	next  time.Time
+}
+
+func (p *requestPacer) wait(ctx context.Context) error {
+	p.mu.Lock()
+	now := time.Now()
+	start := now
+	if p.next.After(start) {
+		start = p.next
+	}
+	p.next = start.Add(p.delay)
+	wait := start.Sub(now)
+	p.mu.Unlock()
+	return sleepContext(ctx, wait)
 }
 
 var ErrSyncInProgress = errors.New("a sync is already in progress")
@@ -136,7 +160,22 @@ func New(cfg Config) *Client {
 	if cfg.RefreshWindow <= 0 {
 		cfg.RefreshWindow = defaultRefreshWindow
 	}
-	return &Client{cfg: cfg, http: &http.Client{Timeout: cfg.HTTPTimeout}}
+	if cfg.DetailWorkers <= 0 {
+		cfg.DetailWorkers = defaultDetailWorkers
+	}
+	if cfg.MaxConnections <= 0 {
+		cfg.MaxConnections = cfg.DetailWorkers
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConns = cfg.MaxConnections
+	transport.MaxIdleConnsPerHost = cfg.MaxConnections
+	transport.MaxConnsPerHost = cfg.MaxConnections
+	transport.IdleConnTimeout = 90 * time.Second
+	return &Client{
+		cfg:   cfg,
+		http:  &http.Client{Timeout: cfg.HTTPTimeout, Transport: transport},
+		pacer: &requestPacer{delay: cfg.Delay},
+	}
 }
 
 func (c *Client) Sync(ctx context.Context, req SyncRequest) ([]model.Announcement, error) {
@@ -219,9 +258,6 @@ func (c *Client) SyncProgress(ctx context.Context, req SyncRequest, progress Pro
 		if pageIsOlderThan(pageEntries, req.StartDate) {
 			break
 		}
-		if err := sleepContext(ctx, c.cfg.Delay); err != nil {
-			return nil, err
-		}
 	}
 
 	ordered := make([]string, 0, len(entriesByID))
@@ -275,8 +311,10 @@ func (c *Client) SyncProgress(ctx context.Context, req SyncRequest, progress Pro
 
 	out := make([]model.Announcement, 0, len(detailIDs))
 	failed := make([]string, 0)
-	for i, id := range detailIDs {
-		body, detailURL, err := c.fetchDetail(ctx, id)
+	detailResults := c.fetchDetails(ctx, detailIDs)
+	for i, result := range detailResults {
+		id := result.id
+		body, detailURL, err := result.body, result.detailURL, result.err
 		if err != nil {
 			failed = append(failed, fmt.Sprintf("%s: %v", id, err))
 			stats.FailedIDs++
@@ -380,11 +418,6 @@ func (c *Client) SyncProgress(ctx context.Context, req SyncRequest, progress Pro
 				}
 			}
 		}
-		if i < len(detailIDs)-1 {
-			if err := sleepContext(ctx, c.cfg.Delay); err != nil {
-				return out, err
-			}
-		}
 	}
 	if len(failed) > 0 {
 		if err := emitProgress(progress, ProgressEvent{
@@ -474,6 +507,86 @@ func (c *Client) fetchDetail(ctx context.Context, id string) (body, detailURL st
 	return
 }
 
+type detailJob struct {
+	index int
+	id    string
+}
+
+type detailResult struct {
+	index     int
+	id        string
+	body      string
+	detailURL string
+	err       error
+}
+
+func (c *Client) fetchDetails(ctx context.Context, ids []string) []detailResult {
+	results := make([]detailResult, len(ids))
+	if len(ids) == 0 {
+		return results
+	}
+	workerCount := c.cfg.DetailWorkers
+	if workerCount <= 0 {
+		workerCount = defaultDetailWorkers
+	}
+	if workerCount > len(ids) {
+		workerCount = len(ids)
+	}
+
+	jobs := make(chan detailJob)
+	resultCh := make(chan detailResult, len(ids))
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			defer workers.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case job, ok := <-jobs:
+					if !ok {
+						return
+					}
+					body, detailURL, err := c.fetchDetail(ctx, job.id)
+					resultCh <- detailResult{index: job.index, id: job.id, body: body, detailURL: detailURL, err: err}
+				}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for i, id := range ids {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- detailJob{index: i, id: id}:
+			}
+		}
+	}()
+	go func() {
+		workers.Wait()
+		close(resultCh)
+	}()
+
+	completed := make([]bool, len(ids))
+	for result := range resultCh {
+		results[result.index] = result
+		completed[result.index] = true
+	}
+	for i, id := range ids {
+		if completed[i] {
+			continue
+		}
+		err := ctx.Err()
+		if err == nil {
+			err = errors.New("detail worker did not return a result")
+		}
+		results[i] = detailResult{index: i, id: id, err: err}
+	}
+	return results
+}
+
 func (c *Client) fetch(ctx context.Context, u string) (string, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.cfg.MaxRetries; attempt++ {
@@ -500,6 +613,11 @@ func (c *Client) fetchOnce(ctx context.Context, u string) (body string, retry bo
 	req.Header.Set("User-Agent", c.cfg.UserAgent)
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	if c.pacer != nil {
+		if err := c.pacer.wait(ctx); err != nil {
+			return "", false, err
+		}
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return "", true, err

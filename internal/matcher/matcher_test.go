@@ -311,8 +311,118 @@ func TestRankingUsesPublishedDateThenStableID(t *testing.T) {
 	if len(jobs) != 3 {
 		t.Fatalf("jobs=%d", len(jobs))
 	}
+	if jobs[0].Score == nil || jobs[1].Score == nil || jobs[2].Score == nil || *jobs[0].Score != *jobs[1].Score || *jobs[1].Score != *jobs[2].Score {
+		t.Fatalf("expected a genuine score tie: %#v", jobs)
+	}
 	if jobs[0].Announcement.ID != "new" || jobs[1].Announcement.ID != "same" || jobs[2].Announcement.ID != "old" {
 		t.Fatalf("unexpected order: %s, %s, %s", jobs[0].Announcement.ID, jobs[1].Announcement.ID, jobs[2].Announcement.ID)
+	}
+}
+
+func TestSemanticCoverageRanksFullMatchAboveNewerPartialMatch(t *testing.T) {
+	profile := model.Profile{Skills: "冶金 炼钢 转炉 人工智能 机器学习"}
+	items := []model.Announcement{
+		{
+			ID:            "relevant",
+			PublishedDate: "2026-09-01",
+			Positions: []model.Position{{
+				ID:   "relevant:1",
+				Name: "转炉智能炼钢工业人工智能机器学习工程师",
+			}},
+		},
+		{
+			ID:            "partial",
+			PublishedDate: "2026-09-09",
+			Positions: []model.Position{{
+				ID:   "partial:1",
+				Name: "冶金工艺工程师",
+			}},
+		},
+	}
+	relevant := Score(items[0], items[0].Positions[0], profile)
+	partial := Score(items[1], items[1].Positions[0], profile)
+	if relevant.Score == nil || partial.Score == nil {
+		t.Fatalf("scores must be present: relevant=%v partial=%v", relevant.Score, partial.Score)
+	}
+	if *relevant.Score <= *partial.Score {
+		t.Fatalf("full match did not outrank partial match: relevant=%d partial=%d", *relevant.Score, *partial.Score)
+	}
+	ranked := Flatten(items, profile)
+	if len(ranked) != 2 || ranked[0].Announcement.ID != "relevant" || ranked[1].Announcement.ID != "partial" {
+		t.Fatalf("unexpected ranking: %#v", ranked)
+	}
+}
+
+func TestSingleSemanticTermRetainsFullCredit(t *testing.T) {
+	view := Score(model.Announcement{}, model.Position{Name: "机器学习工程师"}, model.Profile{Skills: "机器学习"})
+	if view.Score == nil || *view.Score != 100 {
+		t.Fatalf("1/1 semantic match lost full credit: %v", view.Score)
+	}
+}
+
+func TestPartialBroadSemanticCoverageDoesNotSaturate(t *testing.T) {
+	profile := model.Profile{Skills: "冶金 炼钢 转炉 人工智能 机器学习"}
+	full := Score(model.Announcement{}, model.Position{Name: "转炉智能炼钢工业人工智能机器学习工程师"}, profile)
+	partial := Score(model.Announcement{}, model.Position{Name: "冶金工艺工程师"}, profile)
+	if full.Score == nil || partial.Score == nil {
+		t.Fatalf("scores must be present: full=%v partial=%v", full.Score, partial.Score)
+	}
+	if *full.Score != 100 || *partial.Score >= *full.Score {
+		t.Fatalf("broad partial coverage saturated: full=%d partial=%d", *full.Score, *partial.Score)
+	}
+}
+
+func TestVerifiedSemanticEvidenceOutranksFallbackOnly(t *testing.T) {
+	profile := model.Profile{Skills: "机器学习 Python"}
+	verified := Score(model.Announcement{}, model.Position{Name: "机器学习 Python 工程师"}, profile)
+	fallback := Score(
+		model.Announcement{RawText: "岗位见正文：机器学习 Python"},
+		model.Position{Name: "招聘公告（岗位见正文）"},
+		profile,
+	)
+	if verified.Score == nil || fallback.Score == nil || *verified.Score <= *fallback.Score {
+		t.Fatalf("verified evidence did not outrank fallback: verified=%v fallback=%v", verified.Score, fallback.Score)
+	}
+	foundPrimary := false
+	for _, evidence := range verified.MatchEvidence {
+		if evidence.Provenance == model.PositionPrimary {
+			foundPrimary = true
+			break
+		}
+	}
+	if !foundPrimary {
+		t.Fatalf("verified provenance was not preserved: %#v", verified.MatchEvidence)
+	}
+	foundFallback := false
+	for _, evidence := range fallback.MatchEvidence {
+		if evidence.Provenance != model.AnnouncementGlobalFallback {
+			t.Fatalf("fallback evidence was not isolated: %#v", fallback.MatchEvidence)
+		}
+		foundFallback = true
+	}
+	if !foundFallback {
+		t.Fatalf("fallback provenance was not observable: %#v", fallback.MatchEvidence)
+	}
+}
+
+func TestUnrelatedRolesReceiveNoSemanticLift(t *testing.T) {
+	profile := model.Profile{Skills: "冶金 炼钢 转炉 人工智能 机器学习"}
+	for _, name := range []string{"行政专员", "销售专员", "财务专员", "客户服务专员"} {
+		t.Run(name, func(t *testing.T) {
+			view := Score(model.Announcement{}, model.Position{Name: name}, profile)
+			if view.Score == nil || *view.Score != 0 || len(view.MatchEvidence) != 0 {
+				t.Fatalf("unrelated role received semantic lift: score=%v evidence=%#v", view.Score, view.MatchEvidence)
+			}
+		})
+	}
+}
+
+func TestSemanticCoverageNormalizesTermOrderAndDuplicates(t *testing.T) {
+	position := model.Position{Name: "冶金转炉工程师"}
+	left := Score(model.Announcement{}, position, model.Profile{Skills: "冶金 转炉 冶金"})
+	right := Score(model.Announcement{}, position, model.Profile{Skills: "转炉 冶金"})
+	if left.Score == nil || right.Score == nil || *left.Score != *right.Score {
+		t.Fatalf("term order or duplicate normalization changed score: left=%v right=%v", left.Score, right.Score)
 	}
 }
 

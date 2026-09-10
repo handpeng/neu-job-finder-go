@@ -7,8 +7,27 @@ type EvidenceProvenance string
 const (
 	PositionPrimary            EvidenceProvenance = "POSITION_PRIMARY"
 	PositionLocal              EvidenceProvenance = "POSITION_LOCAL"
+	PositionFallback           EvidenceProvenance = "POSITION_FALLBACK"
+	PositionAmbiguous          EvidenceProvenance = "POSITION_AMBIGUOUS"
 	AnnouncementCommon         EvidenceProvenance = "ANNOUNCEMENT_COMMON"
 	AnnouncementGlobalFallback EvidenceProvenance = "ANNOUNCEMENT_GLOBAL_FALLBACK"
+)
+
+type ExtractionQuality string
+
+const (
+	ExtractionConfident ExtractionQuality = "confident"
+	ExtractionFallback  ExtractionQuality = "fallback"
+	ExtractionAmbiguous ExtractionQuality = "ambiguous"
+)
+
+const (
+	PositionFieldName           = "name"
+	PositionFieldSalary         = "salary"
+	PositionFieldLocation       = "location"
+	PositionFieldEmploymentType = "employment_type"
+	PositionFieldDegree         = "degree"
+	PositionFieldMajors         = "majors"
 )
 
 type EvidenceFragment struct {
@@ -55,15 +74,19 @@ type Announcement struct {
 }
 
 type Position struct {
-	ID             string             `json:"id"`
-	AnnouncementID string             `json:"announcement_id"`
-	Name           string             `json:"name"`
-	Salary         string             `json:"salary,omitempty"`
-	Location       string             `json:"location,omitempty"`
-	EmploymentType string             `json:"employment_type,omitempty"`
-	Degree         string             `json:"degree,omitempty"`
-	Majors         string             `json:"majors,omitempty"`
-	Evidence       []EvidenceFragment `json:"evidence,omitempty"`
+	ID                string                       `json:"id"`
+	AnnouncementID    string                       `json:"announcement_id"`
+	Name              string                       `json:"name"`
+	Salary            string                       `json:"salary,omitempty"`
+	Location          string                       `json:"location,omitempty"`
+	EmploymentType    string                       `json:"employment_type,omitempty"`
+	Degree            string                       `json:"degree,omitempty"`
+	Majors            string                       `json:"majors,omitempty"`
+	Evidence          []EvidenceFragment           `json:"evidence,omitempty"`
+	SourceText        string                       `json:"source_text,omitempty"`
+	ExtractionQuality ExtractionQuality            `json:"extraction_quality,omitempty"`
+	ExtractionNote    string                       `json:"extraction_note,omitempty"`
+	FieldQuality      map[string]ExtractionQuality `json:"field_quality,omitempty"`
 }
 
 type Profile struct {

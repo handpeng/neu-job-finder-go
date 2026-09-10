@@ -107,6 +107,53 @@ func TestGenericFallbackEvidenceIsExplicitAndCapped(t *testing.T) {
 	}
 }
 
+func TestAmbiguousExtractedFieldsDoNotBecomeVerifiedEvidence(t *testing.T) {
+	position := model.Position{
+		Name:              "算法工程师",
+		Degree:            "硕士",
+		Location:          "北京",
+		ExtractionQuality: model.ExtractionAmbiguous,
+		FieldQuality: map[string]model.ExtractionQuality{
+			model.PositionFieldName:     model.ExtractionConfident,
+			model.PositionFieldDegree:   model.ExtractionAmbiguous,
+			model.PositionFieldLocation: model.ExtractionAmbiguous,
+		},
+	}
+	v := Score(model.Announcement{}, position, model.Profile{
+		Query: model.BooleanQuery{Must: [][]string{{"硕士"}}},
+	})
+	if v.Eligible {
+		t.Fatalf("ambiguous degree satisfied MUST query: %#v", v)
+	}
+	for _, evidence := range v.MatchEvidence {
+		if evidence.Term == "硕士" || evidence.Provenance == model.PositionPrimary {
+			t.Fatalf("ambiguous field became verified evidence: %#v", v.MatchEvidence)
+		}
+	}
+}
+
+func TestFallbackExtractionUsesDistinctEvidenceProvenance(t *testing.T) {
+	v := Score(model.Announcement{}, model.Position{
+		Name:              "研发工程师",
+		ExtractionQuality: model.ExtractionFallback,
+	}, model.Profile{Roles: "研发工程师"})
+	if len(v.MatchEvidence) == 0 {
+		t.Fatal("expected fallback evidence")
+	}
+	foundFallback := false
+	for _, evidence := range v.MatchEvidence {
+		if evidence.Provenance == model.PositionFallback {
+			foundFallback = true
+			if evidence.Confidence >= 1 {
+				t.Fatalf("fallback evidence retained verified confidence: %#v", evidence)
+			}
+		}
+	}
+	if !foundFallback {
+		t.Fatalf("fallback provenance missing: %#v", v.MatchEvidence)
+	}
+}
+
 func TestGenericRecruitmentUsesAnnouncementRolesAndCities(t *testing.T) {
 	v := Score(
 		model.Announcement{

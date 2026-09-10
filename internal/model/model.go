@@ -2,12 +2,34 @@ package model
 
 import "time"
 
+type EvidenceProvenance string
+
+const (
+	PositionPrimary            EvidenceProvenance = "POSITION_PRIMARY"
+	PositionLocal              EvidenceProvenance = "POSITION_LOCAL"
+	AnnouncementCommon         EvidenceProvenance = "ANNOUNCEMENT_COMMON"
+	AnnouncementGlobalFallback EvidenceProvenance = "ANNOUNCEMENT_GLOBAL_FALLBACK"
+)
+
+type EvidenceFragment struct {
+	Text       string             `json:"text,omitempty"`
+	Provenance EvidenceProvenance `json:"provenance"`
+}
+
+type MatchEvidence struct {
+	Field      string             `json:"field"`
+	Term       string             `json:"term"`
+	Provenance EvidenceProvenance `json:"provenance"`
+	Confidence float64            `json:"confidence"`
+}
+
 type Announcement struct {
 	ID                      string     `json:"id"`
 	Company                 string     `json:"company"`
 	DetailURL               string     `json:"detail_url"`
 	ExpireDate              string     `json:"expire_date,omitempty"`
 	PublishedDate           string     `json:"published_date,omitempty"`
+	CommonText              string     `json:"common_text,omitempty"`
 	ApplicationURL          string     `json:"application_url,omitempty"`
 	Email                   string     `json:"email,omitempty"`
 	EmailSubject            string     `json:"email_subject,omitempty"`
@@ -19,14 +41,15 @@ type Announcement struct {
 }
 
 type Position struct {
-	ID             string `json:"id"`
-	AnnouncementID string `json:"announcement_id"`
-	Name           string `json:"name"`
-	Salary         string `json:"salary,omitempty"`
-	Location       string `json:"location,omitempty"`
-	EmploymentType string `json:"employment_type,omitempty"`
-	Degree         string `json:"degree,omitempty"`
-	Majors         string `json:"majors,omitempty"`
+	ID             string             `json:"id"`
+	AnnouncementID string             `json:"announcement_id"`
+	Name           string             `json:"name"`
+	Salary         string             `json:"salary,omitempty"`
+	Location       string             `json:"location,omitempty"`
+	EmploymentType string             `json:"employment_type,omitempty"`
+	Degree         string             `json:"degree,omitempty"`
+	Majors         string             `json:"majors,omitempty"`
+	Evidence       []EvidenceFragment `json:"evidence,omitempty"`
 }
 
 type Profile struct {
@@ -41,10 +64,11 @@ type Profile struct {
 }
 
 type JobView struct {
-	Announcement Announcement `json:"announcement"`
-	Position     Position     `json:"position"`
-	Score        *int         `json:"score,omitempty"`
-	Matched      []string     `json:"matched,omitempty"`
-	Missing      []string     `json:"missing,omitempty"`
-	HardMismatch []string     `json:"hard_mismatch,omitempty"`
+	Announcement  Announcement    `json:"announcement"`
+	Position      Position        `json:"position"`
+	Score         *int            `json:"score,omitempty"`
+	Matched       []string        `json:"matched,omitempty"`
+	MatchEvidence []MatchEvidence `json:"match_evidence,omitempty"`
+	Missing       []string        `json:"missing,omitempty"`
+	HardMismatch  []string        `json:"hard_mismatch,omitempty"`
 }

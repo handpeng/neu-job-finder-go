@@ -1,6 +1,7 @@
 package matcher
 
 import (
+	"fmt"
 	"regexp"
 	"sort"
 	"strconv"
@@ -23,13 +24,20 @@ var semanticAliasGroups = [][]string{
 }
 
 type fieldScore struct {
-	name   string
-	weight float64
-	score  float64
-	reason string
-	active bool
-	hard   bool
-	ok     bool
+	name     string
+	weight   float64
+	score    float64
+	reason   string
+	evidence []model.MatchEvidence
+	active   bool
+	hard     bool
+	ok       bool
+}
+
+type evidenceSource struct {
+	text       string
+	provenance model.EvidenceProvenance
+	confidence float64
 }
 
 func Flatten(items []model.Announcement, p model.Profile) []model.JobView {
@@ -60,19 +68,23 @@ func Flatten(items []model.Announcement, p model.Profile) []model.JobView {
 
 func Score(a model.Announcement, pos model.Position, p model.Profile) model.JobView {
 	v := model.JobView{Announcement: a, Position: pos}
-	positionText := strings.Join([]string{pos.Name, pos.Location, pos.Degree, pos.Majors}, " ")
-	context := ""
-	if isGenericPosition(pos.Name, a.Company) {
-		context = a.RawText
+	generic := isGenericPosition(pos.Name, a.Company)
+	positionText := strings.Join([]string{pos.Name, pos.Salary, pos.Location, pos.EmploymentType, pos.Degree, pos.Majors}, " ")
+	positionSources := positionEvidence(positionText, pos, a.RawText, generic)
+	roleSources := positionEvidence(pos.Name, pos, a.RawText, generic)
+	majorSources := positionEvidence(pos.Majors, pos, a.RawText, generic)
+	citySources := append([]evidenceSource{}, positionEvidence(pos.Location+" "+pos.Name, pos, a.RawText, generic)...)
+	if strings.TrimSpace(a.CommonText) != "" {
+		citySources = append(citySources, evidenceSource{text: a.CommonText, provenance: model.AnnouncementCommon, confidence: 1})
 	}
 	fields := []fieldScore{
-		semanticField("意向岗位", p.Roles, pos.Name, context, 25),
-		semanticField("核心技能", p.Skills, positionText, a.RawText, 22),
-		semanticField("研究方向", p.Research, pos.Name+" "+pos.Majors, a.RawText, 18),
-		semanticField("专业", p.Major, pos.Majors, a.RawText, 13),
-		cityField(p.Cities, pos.Location, pos.Name, context, 12),
+		semanticField("意向岗位", p.Roles, roleSources, 25),
+		semanticField("核心技能", p.Skills, positionSources, 22),
+		semanticField("研究方向", p.Research, append(append([]evidenceSource{}, roleSources...), majorSources...), 18),
+		semanticField("专业", p.Major, majorSources, 13),
+		cityField(p.Cities, pos.Location, citySources, 12),
 		degreeField(p.Degree, pos.Degree, 10),
-		gradYearField(p.GraduationYear, a.RawText),
+		gradYearField(p.GraduationYear, positionEvidence("", pos, a.RawText, generic), a.CommonText),
 	}
 	active := 0
 	weightSum := 0.0
@@ -86,6 +98,7 @@ func Score(a model.Announcement, pos model.Position, p model.Profile) model.JobV
 		weighted += f.weight * f.score
 		if f.ok && f.reason != "" {
 			v.Matched = append(v.Matched, f.reason)
+			v.MatchEvidence = append(v.MatchEvidence, f.evidence...)
 		} else if f.hard {
 			v.HardMismatch = append(v.HardMismatch, f.name+"：不匹配")
 		} else {
@@ -105,41 +118,92 @@ func Score(a model.Announcement, pos model.Position, p model.Profile) model.JobV
 	return v
 }
 
-func semanticField(name, query, primary, context string, weight float64) fieldScore {
+func positionEvidence(primary string, pos model.Position, fallback string, allowFallback bool) []evidenceSource {
+	sources := make([]evidenceSource, 0, len(pos.Evidence)+2)
+	if strings.TrimSpace(primary) != "" {
+		sources = append(sources, evidenceSource{text: primary, provenance: model.PositionPrimary, confidence: 1})
+	}
+	for _, fragment := range pos.Evidence {
+		if strings.TrimSpace(fragment.Text) == "" {
+			continue
+		}
+		provenance := fragment.Provenance
+		if provenance == "" {
+			provenance = model.PositionLocal
+		}
+		confidence := 0.85
+		if provenance == model.PositionPrimary {
+			confidence = 1
+		}
+		sources = append(sources, evidenceSource{text: fragment.Text, provenance: provenance, confidence: confidence})
+	}
+	if allowFallback && strings.TrimSpace(fallback) != "" {
+		sources = append(sources, evidenceSource{
+			text:       fallback,
+			provenance: model.AnnouncementGlobalFallback,
+			confidence: 0.4,
+		})
+	}
+	return sources
+}
+
+func semanticField(name, query string, sources []evidenceSource, weight float64) fieldScore {
 	q := terms(query)
 	if len(q) == 0 {
 		return fieldScore{name: name}
 	}
 	score := 0.0
-	hits := []string{}
-	contextHits := []string{}
+	hits := []model.MatchEvidence{}
 	for _, term := range q {
-		if matchesTerm(primary, term) {
-			score += 1
-			hits = append(hits, term)
-		} else if context != "" && matchesTerm(context, term) {
-			score += 0.4
-			contextHits = append(contextHits, term)
+		if hit, ok := bestEvidence(sources, term); ok {
+			score += hit.confidence
+			hits = append(hits, model.MatchEvidence{
+				Field:      name,
+				Term:       term,
+				Provenance: hit.provenance,
+				Confidence: hit.confidence,
+			})
 		}
 	}
 	score /= float64(len(q))
 	if len(hits) > 4 {
 		hits = hits[:4]
 	}
-	if len(contextHits) > 4 {
-		contextHits = contextHits[:4]
+	return fieldScore{
+		name:     name,
+		weight:   weight,
+		score:    score,
+		reason:   evidenceReason(name, hits),
+		evidence: hits,
+		active:   true,
+		ok:       score > 0,
 	}
-	reason := ""
-	if len(hits) > 0 {
-		reason = name + "命中（岗位）：" + strings.Join(hits, "、")
-	}
-	if len(contextHits) > 0 {
-		if reason != "" {
-			reason += "；"
+}
+
+func bestEvidence(sources []evidenceSource, term string) (evidenceSource, bool) {
+	best := evidenceSource{}
+	found := false
+	for _, source := range sources {
+		if !matchesTerm(source.text, term) {
+			continue
 		}
-		reason += name + "命中（公告）：" + strings.Join(contextHits, "、")
+		if !found || source.confidence > best.confidence {
+			best = source
+			found = true
+		}
 	}
-	return fieldScore{name: name, weight: weight, score: score, reason: reason, active: true, ok: score > 0}
+	return best, found
+}
+
+func evidenceReason(name string, hits []model.MatchEvidence) string {
+	if len(hits) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(hits))
+	for _, hit := range hits {
+		parts = append(parts, fmt.Sprintf("%s命中（%s）：%s", name, hit.Provenance, hit.Term))
+	}
+	return strings.Join(parts, "；")
 }
 
 func hardContainsField(name, query, target string, weight float64) fieldScore {
@@ -159,21 +223,28 @@ func hardContainsField(name, query, target string, weight float64) fieldScore {
 	return fieldScore{name: name, weight: weight, score: 0, active: true, hard: true, ok: false}
 }
 
-func cityField(query, location, positionName, context string, weight float64) fieldScore {
-	field := hardContainsField("城市", query, location+" "+positionName, weight)
-	if !field.active || field.ok {
-		return field
+func cityField(query, location string, sources []evidenceSource, weight float64) fieldScore {
+	q := terms(query)
+	if len(q) == 0 {
+		return fieldScore{name: "城市"}
 	}
-	for _, term := range terms(query) {
-		if context != "" && strings.Contains(strings.ToLower(context), strings.ToLower(term)) {
-			return fieldScore{name: "城市", weight: weight, score: 0.7, reason: "城市命中（公告）：" + term, active: true, ok: true}
+	for _, term := range q {
+		if hit, ok := bestEvidence(sources, term); ok {
+			hard := hit.provenance == model.PositionPrimary || hit.provenance == model.PositionLocal || hit.provenance == model.AnnouncementCommon
+			return fieldScore{
+				name:     "城市",
+				weight:   weight,
+				score:    hit.confidence,
+				reason:   fmt.Sprintf("城市命中（%s）：%s", hit.provenance, term),
+				evidence: []model.MatchEvidence{{Field: "城市", Term: term, Provenance: hit.provenance, Confidence: hit.confidence}},
+				active:   true,
+				hard:     hard,
+				ok:       true,
+			}
 		}
 	}
-	if strings.TrimSpace(location) == "" {
-		field.hard = false
-		field.score = 0.5
-	}
-	return field
+	primaryEmpty := strings.TrimSpace(location) == ""
+	return fieldScore{name: "城市", weight: weight, score: 0.5, active: true, hard: !primaryEmpty, ok: false}
 }
 
 func isGenericPosition(name, company string) bool {
@@ -207,7 +278,7 @@ func degreeField(query, target string, weight float64) fieldScore {
 	return fieldScore{name: "学历", weight: weight, score: 0, active: true, hard: true, ok: false}
 }
 
-func gradYearField(year, target string) fieldScore {
+func gradYearField(year string, sources []evidenceSource, commonText string) fieldScore {
 	year = strings.TrimSpace(year)
 	if year == "" {
 		return fieldScore{name: "毕业年份"}
@@ -219,11 +290,35 @@ func gradYearField(year, target string) fieldScore {
 	if len(year) == 4 {
 		short = year[2:]
 	}
-	if strings.Contains(target, year+"届") || strings.Contains(target, short+"届") {
-		return fieldScore{name: "毕业年份", weight: 8, score: 1, reason: "毕业年份命中：" + year + "届", active: true, hard: true, ok: true}
+	commonSources := append([]evidenceSource{}, sources...)
+	if strings.TrimSpace(commonText) != "" {
+		commonSources = append(commonSources, evidenceSource{text: commonText, provenance: model.AnnouncementCommon, confidence: 1})
+	}
+	for _, source := range commonSources {
+		if !strings.Contains(source.text, year+"届") && !strings.Contains(source.text, short+"届") {
+			continue
+		}
+		hard := source.provenance != model.AnnouncementGlobalFallback
+		return fieldScore{
+			name:     "毕业年份",
+			weight:   8,
+			score:    source.confidence,
+			reason:   fmt.Sprintf("毕业年份命中（%s）：%s届", source.provenance, year),
+			evidence: []model.MatchEvidence{{Field: "毕业年份", Term: year + "届", Provenance: source.provenance, Confidence: source.confidence}},
+			active:   true,
+			hard:     hard,
+			ok:       true,
+		}
 	}
 	// Generic wording such as "应届毕业生" is not a numeric cohort restriction.
-	if !cohortPattern.MatchString(target) {
+	hasCohort := false
+	for _, source := range commonSources {
+		if cohortPattern.MatchString(source.text) {
+			hasCohort = true
+			break
+		}
+	}
+	if !hasCohort {
 		return fieldScore{name: "毕业年份", weight: 8, score: 0.5, reason: "毕业年份：公告未明确限制", active: true, hard: false, ok: true}
 	}
 	return fieldScore{name: "毕业年份", weight: 8, score: 0, active: true, hard: true, ok: false}

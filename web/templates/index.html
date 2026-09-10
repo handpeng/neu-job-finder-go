@@ -1,0 +1,103 @@
+{{define "index.html"}}
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>NEU Job Finder</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <div class="eyebrow">东北大学就业网 · 增量岗位雷达</div>
+    <h1>NEU Job Finder</h1>
+    <p>公开招聘信息抓取、字段提取、可选条件匹配与投递证据汇总。</p>
+  </div>
+  <a class="source-link" href="http://job.neu.edu.cn/campus/index/" target="_blank" rel="noreferrer">打开原始列表页 ↗</a>
+</header>
+
+<main class="layout">
+  <section class="sidebar card">
+    <form method="get" action="/" id="profileForm">
+      <div class="section-title"><span>01</span> 匹配条件 <small>全部可选</small></div>
+      <label>研究方向<textarea name="research" placeholder="例：转炉智能炼钢、工业人工智能、冶金过程建模">{{.Profile.Research}}</textarea></label>
+      <label>核心技能<textarea name="skills" placeholder="例：Python、Java、机器学习、FastAPI、Spring Boot、PLC、OPC">{{.Profile.Skills}}</textarea></label>
+      <div class="two-col">
+        <label>学历<select name="degree"><option value="">不限</option><option {{if eq .Profile.Degree "本科"}}selected{{end}}>本科</option><option {{if eq .Profile.Degree "硕士"}}selected{{end}}>硕士</option><option {{if eq .Profile.Degree "博士"}}selected{{end}}>博士</option></select></label>
+        <label>毕业年份<input name="graduation_year" value="{{.Profile.GraduationYear}}" placeholder="2027"></label>
+      </div>
+      <label>专业<input name="major" value="{{.Profile.Major}}" placeholder="例：冶金工程"></label>
+      <label>意向城市<input name="cities" value="{{.Profile.Cities}}" placeholder="例：上海、沈阳、北京"></label>
+      <label>意向岗位<input name="roles" value="{{.Profile.Roles}}" placeholder="例：算法工程师、工艺工程师、研发工程师"></label>
+      <label class="check"><input type="checkbox" name="strict" value="1" {{if .Profile.Strict}}checked{{end}}> 严格过滤硬条件不匹配岗位</label>
+      <button class="primary" type="submit">重新评分</button>
+    </form>
+
+    <form method="post" action="/sync" class="sync-form" id="syncForm">
+      <div class="section-title"><span>02</span> 增量抓取</div>
+      <label>发布日期起<input type="date" name="published_since" value="{{.StartDate}}"></label>
+      <label>抓取关键词<input name="keyword" value="{{.Keyword}}" placeholder="可留空"></label>
+      <input type="hidden" name="research" value="{{.Profile.Research}}"><input type="hidden" name="skills" value="{{.Profile.Skills}}"><input type="hidden" name="degree" value="{{.Profile.Degree}}"><input type="hidden" name="graduation_year" value="{{.Profile.GraduationYear}}"><input type="hidden" name="major" value="{{.Profile.Major}}"><input type="hidden" name="cities" value="{{.Profile.Cities}}"><input type="hidden" name="roles" value="{{.Profile.Roles}}">{{if .Profile.Strict}}<input type="hidden" name="strict" value="1">{{end}}
+      <button class="sync" type="submit">开始低频同步</button>
+      <p class="hint">从所选日期抓取到最新公告；默认为最近 30 天。详情页之间至少等待约 1.2 秒。</p>
+      <div class="sync-progress" id="syncProgress" hidden aria-live="polite">
+        <div class="progress-heading"><strong id="progressMessage">准备同步</strong><span id="progressCount"></span></div>
+        <progress id="progressBar" value="0" max="1"></progress>
+        <ul class="live-items" id="liveItems"></ul>
+      </div>
+    </form>
+  </section>
+
+  <section class="content">
+    {{if .Message}}<div class="notice success">{{.Message}}</div>{{end}}
+    {{if .Error}}<div class="notice error">{{.Error}}</div>{{end}}
+    <div class="stats">
+      <div class="stat"><strong id="announcementCount">{{.AnnouncementN}}</strong><span>已缓存公告</span></div>
+      <div class="stat"><strong id="positionCount">{{.PositionN}}</strong><span>已提取岗位</span></div>
+      <div class="stat"><strong>{{.ScoredN}}</strong><span>已评分岗位</span></div>
+    </div>
+
+    <div class="toolbar card">
+      <form method="get" action="/" class="searchbar">
+        <input name="q" placeholder="在已抓取岗位中搜索公司 / 岗位 / 城市 / 专业">
+        <input type="hidden" name="research" value="{{.Profile.Research}}"><input type="hidden" name="skills" value="{{.Profile.Skills}}"><input type="hidden" name="degree" value="{{.Profile.Degree}}"><input type="hidden" name="graduation_year" value="{{.Profile.GraduationYear}}"><input type="hidden" name="major" value="{{.Profile.Major}}"><input type="hidden" name="cities" value="{{.Profile.Cities}}"><input type="hidden" name="roles" value="{{.Profile.Roles}}">{{if .Profile.Strict}}<input type="hidden" name="strict" value="1">{{end}}
+        <button type="submit">搜索</button>
+      </form>
+      <div class="exports">
+        <a href="/export.xlsx?research={{urlquery .Profile.Research}}&skills={{urlquery .Profile.Skills}}&degree={{urlquery .Profile.Degree}}&graduation_year={{urlquery .Profile.GraduationYear}}&major={{urlquery .Profile.Major}}&cities={{urlquery .Profile.Cities}}&roles={{urlquery .Profile.Roles}}&strict={{if .Profile.Strict}}1{{end}}">Excel</a>
+        <a href="/export.md?research={{urlquery .Profile.Research}}&skills={{urlquery .Profile.Skills}}&degree={{urlquery .Profile.Degree}}&graduation_year={{urlquery .Profile.GraduationYear}}&major={{urlquery .Profile.Major}}&cities={{urlquery .Profile.Cities}}&roles={{urlquery .Profile.Roles}}&strict={{if .Profile.Strict}}1{{end}}">Markdown</a>
+        <a href="/export.csv?research={{urlquery .Profile.Research}}&skills={{urlquery .Profile.Skills}}&degree={{urlquery .Profile.Degree}}&graduation_year={{urlquery .Profile.GraduationYear}}&major={{urlquery .Profile.Major}}&cities={{urlquery .Profile.Cities}}&roles={{urlquery .Profile.Roles}}&strict={{if .Profile.Strict}}1{{end}}">CSV</a>
+      </div>
+    </div>
+
+    <div class="job-list">
+      {{range .Jobs}}
+      <article class="job card">
+        <div class="score {{scoreClass .Score}}"><b>{{scoreText .Score}}</b><span>{{if .Score}}匹配分{{else}}条件为空{{end}}</span></div>
+        <div class="job-main">
+          <div class="job-heading"><div><h2>{{.Position.Name}}</h2><p>{{.Announcement.Company}}</p></div><a href="{{.Announcement.DetailURL}}" target="_blank" rel="noreferrer">原文 ↗</a></div>
+          <div class="chips"><span>{{if .Position.Location}}{{.Position.Location}}{{else}}地点未注明{{end}}</span><span>{{if .Position.Degree}}{{.Position.Degree}}{{else}}学历未注明{{end}}</span><span>{{if .Position.Salary}}{{.Position.Salary}}{{else}}薪资面议/未注明{{end}}</span>{{if .Announcement.PublishedDate}}<span>发布 {{.Announcement.PublishedDate}}</span>{{end}}{{if .Announcement.ExpireDate}}<span>截止 {{.Announcement.ExpireDate}}</span>{{end}}</div>
+          {{if .Position.Majors}}<p class="majors"><b>需求专业</b> {{.Position.Majors}}</p>{{end}}
+          {{if .Matched}}<p class="evidence good"><b>匹配证据</b> {{join .Matched " · "}}</p>{{end}}
+          {{if .HardMismatch}}<p class="evidence bad"><b>硬条件</b> {{join .HardMismatch " · "}}</p>{{end}}
+          {{if .Missing}}<p class="evidence"><b>待核实</b> {{join .Missing " · "}}</p>{{end}}
+          <div class="apply-grid">
+            <div><small>投递邮箱</small><strong>{{if .Announcement.Email}}{{.Announcement.Email}}{{else}}未从正文可靠提取{{end}}</strong></div>
+            <div><small>网申链接</small>{{if .Announcement.ApplicationURL}}<a href="{{.Announcement.ApplicationURL}}" target="_blank" rel="noreferrer">打开网申 ↗</a>{{else}}<strong>未从正文可靠提取</strong>{{end}}</div>
+            <div class="wide"><small>邮件标题 / 命名要求</small><strong>{{if .Announcement.EmailSubject}}{{.Announcement.EmailSubject}}{{else}}未提取到明确格式{{end}}</strong></div>
+            <div class="wide"><small>投递要求</small><strong>{{if .Announcement.ApplicationRequirements}}{{.Announcement.ApplicationRequirements}}{{else}}未提取到明确要求，请核对原文{{end}}</strong></div>
+          </div>
+        </div>
+      </article>
+      {{else}}
+      <div class="empty card"><h2>还没有岗位数据</h2><p>选择“发布日期起”后点击“开始低频同步”。个人条件和关键词均可留空。</p></div>
+      {{end}}
+    </div>
+  </section>
+</main>
+<footer>仅处理公开招聘信息；自动登录与自动投递不在本版本范围内。</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>
+{{end}}

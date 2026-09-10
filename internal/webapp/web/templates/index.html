@@ -36,7 +36,7 @@
 
     <form method="post" action="/sync" class="sync-form" id="syncForm">
       <div class="section-title"><span>02</span> 增量抓取</div>
-      <label>发布日期起<input type="date" name="published_since" value="{{.StartDate}}"></label>
+      <div class="two-col"><label>发布日期起<input type="date" name="published_since" value="{{.StartDate}}"></label><label>发布日期止<input type="date" name="published_until" value="{{.EndDate}}"></label></div>
       <label>抓取关键词<input name="keyword" value="{{.Keyword}}" placeholder="可留空"></label>
       <input type="hidden" name="research" value="{{.Profile.Research}}"><input type="hidden" name="skills" value="{{.Profile.Skills}}"><input type="hidden" name="degree" value="{{.Profile.Degree}}"><input type="hidden" name="graduation_year" value="{{.Profile.GraduationYear}}"><input type="hidden" name="major" value="{{.Profile.Major}}"><input type="hidden" name="cities" value="{{.Profile.Cities}}"><input type="hidden" name="roles" value="{{.Profile.Roles}}">{{if .Profile.Strict}}<input type="hidden" name="strict" value="1">{{end}}
       <button class="sync" type="submit">开始低频同步</button>

@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
+
+	"neu-job-finder/internal/model"
 )
 
 func TestExtractDetailIDs(t *testing.T) {
@@ -110,6 +113,276 @@ func TestSyncCompressedSiteShape(t *testing.T) {
 	}
 	if len(item.Positions) != 1 || item.Positions[0].Name != "算法工程师" {
 		t.Fatalf("positions=%#v", item.Positions)
+	}
+}
+
+func TestValidateSyncRequest(t *testing.T) {
+	tests := []struct {
+		name string
+		req  SyncRequest
+	}{
+		{name: "end before start", req: SyncRequest{StartDate: "2026-09-10", EndDate: "2026-09-09"}},
+		{name: "invalid start", req: SyncRequest{StartDate: "2026-02-30", EndDate: "2026-03-01"}},
+		{name: "invalid end", req: SyncRequest{StartDate: "2026-03-01", EndDate: "not-a-date"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateSyncRequest(tt.req); err == nil {
+				t.Fatalf("validateSyncRequest(%#v) returned nil", tt.req)
+			}
+		})
+	}
+}
+
+func TestPublishedInRangeIsInclusive(t *testing.T) {
+	tests := []struct {
+		date string
+		want bool
+	}{
+		{date: "2026-09-01", want: true},
+		{date: "2026-09-15", want: true},
+		{date: "2026-09-30", want: true},
+		{date: "2026-08-31", want: false},
+		{date: "2026-10-01", want: false},
+		{date: "", want: true},
+	}
+	for _, tt := range tests {
+		if got := publishedInRange(tt.date, "2026-09-01", "2026-09-30"); got != tt.want {
+			t.Errorf("publishedInRange(%q)=%v, want %v", tt.date, got, tt.want)
+		}
+	}
+}
+
+func TestPageIsOlderThanRequiresEveryEntryToBeDatedAndOld(t *testing.T) {
+	start := "2026-09-01"
+	if !pageIsOlderThan([]listEntry{{ID: "old", PublishedDate: "2026-08-31"}}, start) {
+		t.Fatal("all dated old page should be safe to stop")
+	}
+	if pageIsOlderThan([]listEntry{{ID: "old", PublishedDate: "2026-08-31"}, {ID: "undated"}}, start) {
+		t.Fatal("undated entry must prevent page stopping")
+	}
+	if pageIsOlderThan([]listEntry{{ID: "old", PublishedDate: "2026-08-31"}, {ID: "new", PublishedDate: "2026-09-02"}}, start) {
+		t.Fatal("mixed old/new page must prevent page stopping")
+	}
+	if pageIsOlderThan([]listEntry{{ID: "old", PublishedDate: "2026-08-31"}}, "") {
+		t.Fatal("without a lower bound the crawler must not stop by date")
+	}
+}
+
+func TestFetchListQuerySemantics(t *testing.T) {
+	var queries []url.Values
+	client := New(Config{BaseURL: "http://example.test", Delay: time.Nanosecond, MaxPages: 2})
+	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		queries = append(queries, req.URL.Query())
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("<html></html>")),
+			Request:    req,
+		}, nil
+	})
+	if _, err := client.fetchList(context.Background(), 2, SyncRequest{
+		StartDate: "2026-09-01",
+		EndDate:   "2026-09-30",
+		Keyword:   "冶金",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.fetchList(context.Background(), 1, SyncRequest{
+		StartDate: "2026-09-01",
+		EndDate:   "2026-09-30",
+		Keyword:   "冶金,人工智能",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(queries) != 2 {
+		t.Fatalf("queries=%d", len(queries))
+	}
+	first := queries[0]
+	if first.Get("page") != "2" || first.Get("starttime") != "2026-09-01" || first.Get("endtime") != "2026-09-30" || first.Get("keyword") != "冶金" {
+		t.Fatalf("single-keyword query=%v", first)
+	}
+	second := queries[1]
+	if second.Get("page") != "" || second.Get("starttime") != "2026-09-01" || second.Get("endtime") != "2026-09-30" || second.Get("keyword") != "" {
+		t.Fatalf("multi-keyword query=%v", second)
+	}
+}
+
+func TestSyncMixedPagesAndDiscoveryCounters(t *testing.T) {
+	lists := map[string]string{
+		"": listPage(
+			listEntryHTML("100", "2026-09-10"),
+			listEntryHTML("101", ""),
+			listEntryHTML("102", "2026-08-31"),
+		),
+		"2": listPage(
+			listEntryHTML("100", "2026-09-10"),
+			listEntryHTML("103", "2026-09-01"),
+			listEntryHTML("104", "2026-08-30"),
+		),
+		"3": listPage(listEntryHTML("105", "2026-08-29")),
+	}
+	detailDates := map[string]string{
+		"100": "2026-09-10",
+		"101": "2026-09-05",
+		"103": "2026-09-01",
+	}
+	var pages []string
+	var details []string
+	var done ProgressEvent
+	client := New(Config{BaseURL: "http://example.test", Delay: time.Nanosecond, MaxPages: 5})
+	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/campus/index/" {
+			page := req.URL.Query().Get("page")
+			pages = append(pages, page)
+			body, ok := lists[page]
+			if !ok {
+				body = "<html></html>"
+			}
+			return responseFor(req, body), nil
+		}
+		id := strings.TrimPrefix(req.URL.Path, "/campus/view/id/")
+		details = append(details, id)
+		return responseFor(req, detailPage(id, detailDates[id])), nil
+	})
+
+	items, err := client.SyncProgress(context.Background(), SyncRequest{
+		StartDate: "2026-09-01",
+		EndDate:   "2026-09-30",
+	}, func(event ProgressEvent) error {
+		if event.Phase == "done" {
+			done = event
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(pages, ",") != ",2,3" {
+		t.Fatalf("pages=%v", pages)
+	}
+	if strings.Join(details, ",") != "100,103,101" {
+		t.Fatalf("details=%v", details)
+	}
+	if len(items) != 3 {
+		t.Fatalf("items=%d %#v", len(items), items)
+	}
+	if done.EntriesSeen != 7 || done.UniqueIDs != 6 || done.InRangeIDs != 3 || done.DuplicateIDs != 1 || done.UndatedIDs != 1 {
+		t.Fatalf("discovery counters=%+v", done)
+	}
+	if done.AcceptedIDs != 3 || done.FilteredIDs != 0 || done.FailedIDs != 0 {
+		t.Fatalf("result counters=%+v", done)
+	}
+}
+
+func TestSyncDetailDateIsValidatedAgainstRequestedRange(t *testing.T) {
+	client := New(Config{BaseURL: "http://example.test", Delay: time.Nanosecond, MaxPages: 1})
+	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/campus/index/" {
+			return responseFor(req, listPage(listEntryHTML("200", "2026-09-10"))), nil
+		}
+		return responseFor(req, detailPage("200", "2026-10-01")), nil
+	})
+	var done ProgressEvent
+	items, err := client.SyncProgress(context.Background(), SyncRequest{
+		StartDate: "2026-09-01",
+		EndDate:   "2026-09-30",
+	}, func(event ProgressEvent) error {
+		if event.Phase == "done" {
+			done = event
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("out-of-range detail was accepted: %#v", items)
+	}
+	if done.InRangeIDs != 1 || done.FilteredIDs != 1 || done.AcceptedIDs != 0 || done.FailedIDs != 0 {
+		t.Fatalf("counters=%+v", done)
+	}
+}
+
+func TestSyncReportsFailedDetailsSeparatelyFromAcceptedItems(t *testing.T) {
+	client := New(Config{BaseURL: "http://example.test", Delay: time.Nanosecond, MaxPages: 1})
+	var partial ProgressEvent
+	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/campus/index/" {
+			return responseFor(req, listPage(
+				listEntryHTML("201", "2026-09-10"),
+				listEntryHTML("202", "2026-09-09"),
+			)), nil
+		}
+		if strings.HasSuffix(req.URL.Path, "/201") {
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Status:     "404 Not Found",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("not found")),
+				Request:    req,
+			}, nil
+		}
+		return responseFor(req, detailPage("202", "2026-09-09")), nil
+	})
+	items, err := client.SyncProgress(context.Background(), SyncRequest{
+		StartDate: "2026-09-01",
+		EndDate:   "2026-09-30",
+	}, func(event ProgressEvent) error {
+		if event.Phase == "partial" {
+			partial = event
+		}
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "201") {
+		t.Fatalf("expected partial detail error containing 201, got %v", err)
+	}
+	if len(items) != 1 || items[0].ID != "202" {
+		t.Fatalf("items=%#v", items)
+	}
+	if partial.InRangeIDs != 2 || partial.AcceptedIDs != 1 || partial.FailedIDs != 1 || partial.FilteredIDs != 0 {
+		t.Fatalf("partial counters=%+v", partial)
+	}
+}
+
+func TestAnnouncementKeywordUsesLocalOR(t *testing.T) {
+	a := model.Announcement{Company: "测试公司", RawText: "人工智能岗位", Positions: []model.Position{{Name: "研发工程师"}}}
+	if !announcementMatchesKeyword(a, "冶金,人工智能") {
+		t.Fatal("one matching crawler keyword should be sufficient")
+	}
+	if announcementMatchesKeyword(a, "冶金,销售") {
+		t.Fatal("non-matching crawler keywords should not match")
+	}
+	if got := sourceKeyword("冶金"); got != "冶金" {
+		t.Fatalf("sourceKeyword(single)=%q", got)
+	}
+	if got := sourceKeyword("冶金,人工智能"); got != "" {
+		t.Fatalf("sourceKeyword(multiple)=%q", got)
+	}
+}
+
+func listPage(entries ...string) string {
+	return "<html>" + strings.Join(entries, "") + "</html>"
+}
+
+func listEntryHTML(id, date string) string {
+	dateItem := ""
+	if date != "" {
+		dateItem = "<li>" + date + " 09:00:00</li>"
+	}
+	return fmt.Sprintf("<ul class='infoList'><li><a href='/campus/view/id/%s'>公司%s</a></li>%s</ul>", id, id, dateItem)
+}
+
+func detailPage(id, date string) string {
+	return fmt.Sprintf("<html><title>公司%s</title><div>发布时间：%s</div><p>公开招聘公告</p></html>", id, date)
+}
+
+func responseFor(req *http.Request, body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    req,
 	}
 }
 

@@ -15,6 +15,7 @@ func main() {
 	data := flag.String("data", "data/store.json", "data file")
 	base := flag.String("base-url", "http://job.neu.edu.cn", "source site base URL")
 	start := flag.String("start", "", "publication start date YYYY-MM-DD; default 30 days ago")
+	end := flag.String("end", "", "publication end date YYYY-MM-DD; default today")
 	keyword := flag.String("keyword", "", "optional source keyword")
 	delay := flag.Duration("delay", 1200*time.Millisecond, "delay between source requests")
 	maxPages := flag.Int("max-pages", 100, "maximum list pages")
@@ -24,6 +25,9 @@ func main() {
 	if *start == "" {
 		*start = now.AddDate(0, 0, -30).Format("2006-01-02")
 	}
+	if *end == "" {
+		*end = now.Format("2006-01-02")
+	}
 	st, err := store.Open(*data)
 	if err != nil {
 		fatal(err)
@@ -31,7 +35,7 @@ func main() {
 	cr := crawler.New(crawler.Config{BaseURL: *base, Delay: *delay, MaxPages: *maxPages})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	items, err := cr.Sync(ctx, crawler.SyncRequest{StartDate: *start, Keyword: *keyword})
+	items, err := cr.Sync(ctx, crawler.SyncRequest{StartDate: *start, EndDate: *end, Keyword: *keyword})
 	if err != nil && len(items) == 0 {
 		fatal(err)
 	}
@@ -43,7 +47,7 @@ func main() {
 	if syncErr != nil {
 		fmt.Fprintln(os.Stderr, "WARNING:", syncErr)
 	}
-	fmt.Printf("SYNC_OK published_since=%s fetched=%d inserted=%d updated=%d positions=%d\n", *start, len(items), ins, upd, st.CountPositions())
+	fmt.Printf("SYNC_OK published_since=%s published_until=%s fetched=%d inserted=%d updated=%d positions=%d\n", *start, *end, len(items), ins, upd, st.CountPositions())
 }
 
 func fatal(err error) {

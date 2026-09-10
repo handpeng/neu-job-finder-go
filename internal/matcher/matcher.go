@@ -463,7 +463,7 @@ func semanticField(name, query string, sources []evidenceSource, weight float64)
 			})
 		}
 	}
-	score := semanticEvidenceScore(evidenceScore, allHits)
+	score := semanticEvidenceScore(evidenceScore, len(q), allHits)
 	hits := allHits
 	if len(hits) > 4 {
 		hits = hits[:4]
@@ -480,11 +480,12 @@ func semanticField(name, query string, sources []evidenceSource, weight float64)
 	}
 }
 
-func semanticEvidenceScore(sum float64, hits []model.MatchEvidence) float64 {
-	if len(hits) == 0 || sum <= 0 {
+func semanticEvidenceScore(sum float64, queryTermCount int, hits []model.MatchEvidence) float64 {
+	if len(hits) == 0 || sum <= 0 || queryTermCount <= 0 {
 		return 0
 	}
-	score := 0.5 + 0.5*minFloat(sum, 1)
+	coverage := sum / float64(queryTermCount)
+	score := 0.5 + 0.5*minFloat(coverage, 1)
 	fallbackOnly := true
 	for _, hit := range hits {
 		if hit.Provenance != model.AnnouncementGlobalFallback {

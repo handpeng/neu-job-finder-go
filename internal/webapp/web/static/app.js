@@ -43,6 +43,7 @@
     const params = new URLSearchParams(new FormData(document.getElementById("profileForm")));
     const syncData = new FormData(form);
     params.set("published_since", syncData.get("published_since") || "");
+    params.set("published_until", syncData.get("published_until") || "");
     params.set("keyword", syncData.get("keyword") || "");
     return "/?" + params.toString();
   };

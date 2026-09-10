@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"neu-job-finder/internal/model"
 )
@@ -52,6 +53,7 @@ type Config struct {
 
 type SyncRequest struct {
 	StartDate string
+	EndDate   string
 	Keyword   string
 }
 
@@ -68,6 +70,15 @@ type ProgressEvent struct {
 	Page         int
 	Current      int
 	Total        int
+	PagesScanned int
+	EntriesSeen  int
+	UniqueIDs    int
+	InRangeIDs   int
+	DuplicateIDs int
+	UndatedIDs   int
+	FilteredIDs  int
+	FailedIDs    int
+	AcceptedIDs  int
 	Announcement *model.Announcement
 	Message      string
 }
@@ -78,6 +89,18 @@ type listEntry struct {
 	ID            string
 	Company       string
 	PublishedDate string
+}
+
+type discoveryStats struct {
+	PagesScanned int
+	EntriesSeen  int
+	UniqueIDs    int
+	InRangeIDs   int
+	DuplicateIDs int
+	UndatedIDs   int
+	FilteredIDs  int
+	FailedIDs    int
+	AcceptedIDs  int
 }
 
 func New(cfg Config) *Client {
@@ -116,9 +139,12 @@ func (c *Client) SyncProgress(ctx context.Context, req SyncRequest, progress Pro
 	}
 
 	entriesByID := make(map[string]listEntry)
-	noNewPages := 0
+	seenIDs := make(map[string]struct{})
+	undatedIDs := make(map[string]struct{})
+	keywords := splitKeywords(req.Keyword)
+	stats := discoveryStats{}
 	for page := 1; page <= c.cfg.MaxPages; page++ {
-		body, err := c.fetchList(ctx, page)
+		body, err := c.fetchList(ctx, page, req)
 		if err != nil {
 			return nil, fmt.Errorf("fetch list page %d: %w", page, err)
 		}
@@ -129,33 +155,45 @@ func (c *Client) SyncProgress(ctx context.Context, req SyncRequest, progress Pro
 			}
 			break
 		}
-		added := 0
 		for _, entry := range pageEntries {
-			if !publishedOnOrAfter(entry.PublishedDate, req.StartDate) {
+			stats.EntriesSeen++
+			if entry.PublishedDate == "" {
+				undatedIDs[entry.ID] = struct{}{}
+				stats.UndatedIDs = len(undatedIDs)
+			}
+			if _, seen := seenIDs[entry.ID]; seen {
+				stats.DuplicateIDs++
+			} else {
+				seenIDs[entry.ID] = struct{}{}
+			}
+			if !publishedInRange(entry.PublishedDate, req.StartDate, req.EndDate) {
 				continue
 			}
 			if _, ok := entriesByID[entry.ID]; !ok {
 				entriesByID[entry.ID] = entry
-				added++
 			}
 		}
+		stats.PagesScanned = page
+		stats.UniqueIDs = len(seenIDs)
+		stats.InRangeIDs = len(entriesByID)
 		if err := emitProgress(progress, ProgressEvent{
-			Phase:   "discovering",
-			Page:    page,
-			Total:   len(entriesByID),
-			Message: fmt.Sprintf("已扫描第 %d 页，发现 %d 条待抓取公告", page, len(entriesByID)),
+			Phase:        "discovering",
+			Page:         page,
+			Total:        len(entriesByID),
+			PagesScanned: stats.PagesScanned,
+			EntriesSeen:  stats.EntriesSeen,
+			UniqueIDs:    stats.UniqueIDs,
+			InRangeIDs:   stats.InRangeIDs,
+			DuplicateIDs: stats.DuplicateIDs,
+			UndatedIDs:   stats.UndatedIDs,
+			FilteredIDs:  stats.FilteredIDs,
+			FailedIDs:    stats.FailedIDs,
+			AcceptedIDs:  stats.AcceptedIDs,
+			Message:      fmt.Sprintf("已扫描第 %d 页，发现 %d 条待抓取公告", page, len(entriesByID)),
 		}); err != nil {
 			return nil, err
 		}
-		if added == 0 {
-			noNewPages++
-		} else {
-			noNewPages = 0
-		}
 		if pageIsOlderThan(pageEntries, req.StartDate) {
-			break
-		}
-		if noNewPages >= 2 {
 			break
 		}
 		if err := sleepContext(ctx, c.cfg.Delay); err != nil {
@@ -168,7 +206,11 @@ func (c *Client) SyncProgress(ctx context.Context, req SyncRequest, progress Pro
 		ordered = append(ordered, id)
 	}
 	sort.Slice(ordered, func(i, j int) bool {
-		return entriesByID[ordered[i]].PublishedDate > entriesByID[ordered[j]].PublishedDate
+		left, right := entriesByID[ordered[i]], entriesByID[ordered[j]]
+		if left.PublishedDate != right.PublishedDate {
+			return left.PublishedDate > right.PublishedDate
+		}
+		return left.ID < right.ID
 	})
 
 	out := make([]model.Announcement, 0, len(ordered))
@@ -177,29 +219,90 @@ func (c *Client) SyncProgress(ctx context.Context, req SyncRequest, progress Pro
 		body, detailURL, err := c.fetchDetail(ctx, id)
 		if err != nil {
 			failed = append(failed, fmt.Sprintf("%s: %v", id, err))
+			stats.FailedIDs++
+			if err := emitProgress(progress, ProgressEvent{
+				Phase:        "failed",
+				Current:      i + 1,
+				Total:        len(ordered),
+				PagesScanned: stats.PagesScanned,
+				EntriesSeen:  stats.EntriesSeen,
+				UniqueIDs:    stats.UniqueIDs,
+				InRangeIDs:   stats.InRangeIDs,
+				DuplicateIDs: stats.DuplicateIDs,
+				UndatedIDs:   stats.UndatedIDs,
+				FilteredIDs:  stats.FilteredIDs,
+				FailedIDs:    stats.FailedIDs,
+				AcceptedIDs:  stats.AcceptedIDs,
+				Message:      fmt.Sprintf("公告 %s 详情抓取失败", id),
+			}); err != nil {
+				return out, err
+			}
 		} else {
 			a := parseDetail(id, detailURL, body)
 			if a.PublishedDate == "" {
 				a.PublishedDate = entriesByID[id].PublishedDate
 			}
-			if announcementMatchesKeyword(a, req.Keyword) {
+			if !publishedInRange(a.PublishedDate, req.StartDate, req.EndDate) {
+				stats.FilteredIDs++
+				if err := emitProgress(progress, ProgressEvent{
+					Phase:        "filtered",
+					Current:      i + 1,
+					Total:        len(ordered),
+					PagesScanned: stats.PagesScanned,
+					EntriesSeen:  stats.EntriesSeen,
+					UniqueIDs:    stats.UniqueIDs,
+					InRangeIDs:   stats.InRangeIDs,
+					DuplicateIDs: stats.DuplicateIDs,
+					UndatedIDs:   stats.UndatedIDs,
+					FilteredIDs:  stats.FilteredIDs,
+					FailedIDs:    stats.FailedIDs,
+					AcceptedIDs:  stats.AcceptedIDs,
+					Message:      "详情发布日期不在请求区间，已跳过",
+				}); err != nil {
+					return out, err
+				}
+				continue
+			}
+			if announcementMatchesKeywords(a, keywords) {
 				out = append(out, a)
+				stats.AcceptedIDs++
 				if err := emitProgress(progress, ProgressEvent{
 					Phase:        "item",
 					Current:      i + 1,
 					Total:        len(ordered),
+					PagesScanned: stats.PagesScanned,
+					EntriesSeen:  stats.EntriesSeen,
+					UniqueIDs:    stats.UniqueIDs,
+					InRangeIDs:   stats.InRangeIDs,
+					DuplicateIDs: stats.DuplicateIDs,
+					UndatedIDs:   stats.UndatedIDs,
+					FilteredIDs:  stats.FilteredIDs,
+					FailedIDs:    stats.FailedIDs,
+					AcceptedIDs:  stats.AcceptedIDs,
 					Announcement: &a,
 					Message:      fmt.Sprintf("已抓取 %s", a.Company),
 				}); err != nil {
 					return out, err
 				}
-			} else if err := emitProgress(progress, ProgressEvent{
-				Phase:   "progress",
-				Current: i + 1,
-				Total:   len(ordered),
-				Message: "公告与抓取关键词不匹配，已跳过",
-			}); err != nil {
-				return out, err
+			} else {
+				stats.FilteredIDs++
+				if err := emitProgress(progress, ProgressEvent{
+					Phase:        "progress",
+					Current:      i + 1,
+					Total:        len(ordered),
+					PagesScanned: stats.PagesScanned,
+					EntriesSeen:  stats.EntriesSeen,
+					UniqueIDs:    stats.UniqueIDs,
+					InRangeIDs:   stats.InRangeIDs,
+					DuplicateIDs: stats.DuplicateIDs,
+					UndatedIDs:   stats.UndatedIDs,
+					FilteredIDs:  stats.FilteredIDs,
+					FailedIDs:    stats.FailedIDs,
+					AcceptedIDs:  stats.AcceptedIDs,
+					Message:      "公告与抓取关键词不匹配，已跳过",
+				}); err != nil {
+					return out, err
+				}
 			}
 		}
 		if i < len(ordered)-1 {
@@ -209,16 +312,42 @@ func (c *Client) SyncProgress(ctx context.Context, req SyncRequest, progress Pro
 		}
 	}
 	if len(failed) > 0 {
+		if err := emitProgress(progress, ProgressEvent{
+			Phase:        "partial",
+			Current:      len(ordered),
+			Total:        len(ordered),
+			PagesScanned: stats.PagesScanned,
+			EntriesSeen:  stats.EntriesSeen,
+			UniqueIDs:    stats.UniqueIDs,
+			InRangeIDs:   stats.InRangeIDs,
+			DuplicateIDs: stats.DuplicateIDs,
+			UndatedIDs:   stats.UndatedIDs,
+			FilteredIDs:  stats.FilteredIDs,
+			FailedIDs:    stats.FailedIDs,
+			AcceptedIDs:  stats.AcceptedIDs,
+			Message:      fmt.Sprintf("同步部分完成，成功 %d 条，失败 %d 条", stats.AcceptedIDs, stats.FailedIDs),
+		}); err != nil {
+			return out, err
+		}
 		if len(failed) > 3 {
 			failed = append(failed[:3], fmt.Sprintf("and %d more", len(failed)-3))
 		}
 		return out, fmt.Errorf("partial sync: %s", strings.Join(failed, "; "))
 	}
 	if err := emitProgress(progress, ProgressEvent{
-		Phase:   "done",
-		Current: len(ordered),
-		Total:   len(ordered),
-		Message: fmt.Sprintf("同步完成，共保留 %d 条公告", len(out)),
+		Phase:        "done",
+		Current:      len(ordered),
+		Total:        len(ordered),
+		PagesScanned: stats.PagesScanned,
+		EntriesSeen:  stats.EntriesSeen,
+		UniqueIDs:    stats.UniqueIDs,
+		InRangeIDs:   stats.InRangeIDs,
+		DuplicateIDs: stats.DuplicateIDs,
+		UndatedIDs:   stats.UndatedIDs,
+		FilteredIDs:  stats.FilteredIDs,
+		FailedIDs:    stats.FailedIDs,
+		AcceptedIDs:  stats.AcceptedIDs,
+		Message:      fmt.Sprintf("同步完成，共保留 %d 条公告", len(out)),
 	}); err != nil {
 		return out, err
 	}
@@ -232,11 +361,20 @@ func emitProgress(progress ProgressFunc, event ProgressEvent) error {
 	return progress(event)
 }
 
-func (c *Client) fetchList(ctx context.Context, page int) (string, error) {
+func (c *Client) fetchList(ctx context.Context, page int, req SyncRequest) (string, error) {
 	u, _ := url.Parse(c.cfg.BaseURL + "/campus/index/")
 	q := u.Query()
 	if page > 1 {
 		q.Set("page", fmt.Sprintf("%d", page))
+	}
+	if req.StartDate != "" {
+		q.Set("starttime", req.StartDate)
+	}
+	if req.EndDate != "" {
+		q.Set("endtime", req.EndDate)
+	}
+	if keyword := sourceKeyword(req.Keyword); keyword != "" {
+		q.Set("keyword", keyword)
 	}
 	u.RawQuery = q.Encode()
 	body, err := c.fetch(ctx, u.String())
@@ -347,21 +485,20 @@ func expandEmbeddedContent(body string) (string, error) {
 
 func extractListEntries(body string) []listEntry {
 	blocks := reInfoList.FindAllStringSubmatch(body, -1)
-	seen := make(map[string]bool)
 	out := make([]listEntry, 0, len(blocks))
 	for _, block := range blocks {
 		idMatch := reDetailID.FindStringSubmatch(block[1])
 		linkMatch := reHref.FindStringSubmatch(block[1])
-		if len(idMatch) < 2 || len(linkMatch) < 3 || seen[idMatch[1]] {
+		if len(idMatch) < 2 || len(linkMatch) < 3 {
 			continue
 		}
-		seen[idMatch[1]] = true
 		entry := listEntry{ID: idMatch[1], Company: strings.TrimSpace(cleanHTML(linkMatch[2]))}
 		if dateMatch := reDate.FindStringSubmatch(cleanHTML(block[1])); len(dateMatch) > 1 {
 			entry.PublishedDate = dateMatch[1]
 		}
 		out = append(out, entry)
 	}
+	seen := make(map[string]bool)
 	if len(out) > 0 {
 		return out
 	}
@@ -375,20 +512,37 @@ func extractListEntries(body string) []listEntry {
 }
 
 func validateSyncRequest(req SyncRequest) error {
-	if req.StartDate == "" {
-		return nil
+	if req.StartDate != "" {
+		if _, err := time.Parse("2006-01-02", req.StartDate); err != nil {
+			return fmt.Errorf("invalid publication start date %q; expected YYYY-MM-DD", req.StartDate)
+		}
 	}
-	if _, err := time.Parse("2006-01-02", req.StartDate); err != nil {
-		return fmt.Errorf("invalid publication start date %q; expected YYYY-MM-DD", req.StartDate)
+	if req.EndDate != "" {
+		if _, err := time.Parse("2006-01-02", req.EndDate); err != nil {
+			return fmt.Errorf("invalid publication end date %q; expected YYYY-MM-DD", req.EndDate)
+		}
+	}
+	if req.StartDate != "" && req.EndDate != "" && req.EndDate < req.StartDate {
+		return fmt.Errorf("publication end date %q is before start date %q", req.EndDate, req.StartDate)
 	}
 	return nil
 }
 
-func publishedOnOrAfter(date, start string) bool {
+func publishedInRange(date, start, end string) bool {
 	if date == "" {
 		return true
 	}
-	return start == "" || date >= start
+	if start != "" && date < start {
+		return false
+	}
+	if end != "" && date > end {
+		return false
+	}
+	return true
+}
+
+func publishedOnOrAfter(date, start string) bool {
+	return publishedInRange(date, start, "")
 }
 
 func pageIsOlderThan(entries []listEntry, start string) bool {
@@ -398,7 +552,7 @@ func pageIsOlderThan(entries []listEntry, start string) bool {
 	hasDate := false
 	for _, entry := range entries {
 		if entry.PublishedDate == "" {
-			continue
+			return false
 		}
 		hasDate = true
 		if entry.PublishedDate >= start {
@@ -409,15 +563,50 @@ func pageIsOlderThan(entries []listEntry, start string) bool {
 }
 
 func announcementMatchesKeyword(a model.Announcement, keyword string) bool {
-	keyword = strings.TrimSpace(strings.ToLower(keyword))
-	if keyword == "" {
+	return announcementMatchesKeywords(a, splitKeywords(keyword))
+}
+
+func announcementMatchesKeywords(a model.Announcement, keywords []string) bool {
+	if len(keywords) == 0 {
 		return true
 	}
 	parts := []string{a.Company, a.RawText}
 	for _, p := range a.Positions {
 		parts = append(parts, p.Name, p.Location, p.Majors)
 	}
-	return strings.Contains(strings.ToLower(strings.Join(parts, " ")), keyword)
+	haystack := strings.ToLower(strings.Join(parts, " "))
+	for _, keyword := range keywords {
+		if strings.Contains(haystack, strings.ToLower(keyword)) {
+			return true
+		}
+	}
+	return false
+}
+
+func splitKeywords(value string) []string {
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return unicode.IsSpace(r) || strings.ContainsRune(",，;；、|", r)
+	})
+	seen := map[string]bool{}
+	keywords := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		key := strings.ToLower(part)
+		if part == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		keywords = append(keywords, part)
+	}
+	return keywords
+}
+
+func sourceKeyword(value string) string {
+	keywords := splitKeywords(value)
+	if len(keywords) == 1 {
+		return keywords[0]
+	}
+	return ""
 }
 
 func extractDetailIDs(body string) []string {

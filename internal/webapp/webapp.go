@@ -38,6 +38,7 @@ type pageData struct {
 	PositionN     int
 	ScoredN       int
 	StartDate     string
+	EndDate       string
 	Keyword       string
 	Message       string
 	Error         string
@@ -87,15 +88,24 @@ func (a *App) Handler() http.Handler {
 }
 
 type streamPayload struct {
-	Type      string
-	Message   string
-	Page      int
-	Current   int
-	Total     int
-	Company   string
-	Positions []string
-	Inserted  int
-	Updated   int
+	Type         string
+	Message      string
+	Page         int
+	Current      int
+	Total        int
+	PagesScanned int
+	EntriesSeen  int
+	UniqueIDs    int
+	InRangeIDs   int
+	DuplicateIDs int
+	UndatedIDs   int
+	FilteredIDs  int
+	FailedIDs    int
+	AcceptedIDs  int
+	Company      string
+	Positions    []string
+	Inserted     int
+	Updated      int
 }
 
 func (a *App) handleSyncStream(w http.ResponseWriter, r *http.Request) {
@@ -135,14 +145,24 @@ func (a *App) handleSyncStream(w http.ResponseWriter, r *http.Request) {
 	updated := 0
 	_, syncErr := a.crawler.SyncProgress(ctx, crawler.SyncRequest{
 		StartDate: r.Form.Get("published_since"),
+		EndDate:   endDateFromValues(r.Form),
 		Keyword:   r.Form.Get("keyword"),
 	}, func(event crawler.ProgressEvent) error {
 		payload := streamPayload{
-			Type:    event.Phase,
-			Message: event.Message,
-			Page:    event.Page,
-			Current: event.Current,
-			Total:   event.Total,
+			Type:         event.Phase,
+			Message:      event.Message,
+			Page:         event.Page,
+			Current:      event.Current,
+			Total:        event.Total,
+			PagesScanned: event.PagesScanned,
+			EntriesSeen:  event.EntriesSeen,
+			UniqueIDs:    event.UniqueIDs,
+			InRangeIDs:   event.InRangeIDs,
+			DuplicateIDs: event.DuplicateIDs,
+			UndatedIDs:   event.UndatedIDs,
+			FilteredIDs:  event.FilteredIDs,
+			FailedIDs:    event.FailedIDs,
+			AcceptedIDs:  event.AcceptedIDs,
 		}
 		if event.Announcement != nil {
 			ins, upd, err := a.store.Upsert([]model.Announcement{*event.Announcement})
@@ -190,9 +210,13 @@ func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
 		now := time.Now()
 		startDate = now.AddDate(0, 0, -30).Format("2006-01-02")
 	}
+	endDate := endDateFromValues(r.URL.Query())
+	if endDate == "" {
+		endDate = time.Now().Format("2006-01-02")
+	}
 	data := pageData{
 		Profile: p, Jobs: jobs, AnnouncementN: len(a.store.All()), PositionN: a.store.CountPositions(),
-		StartDate: startDate, Keyword: r.URL.Query().Get("keyword"),
+		StartDate: startDate, EndDate: endDate, Keyword: r.URL.Query().Get("keyword"),
 		Message: r.URL.Query().Get("message"), Error: r.URL.Query().Get("error"),
 	}
 	for _, j := range jobs {
@@ -212,10 +236,12 @@ func (a *App) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
-	items, err := a.crawler.Sync(ctx, crawler.SyncRequest{StartDate: r.Form.Get("published_since"), Keyword: r.Form.Get("keyword")})
+	endDate := endDateFromValues(r.Form)
+	items, err := a.crawler.Sync(ctx, crawler.SyncRequest{StartDate: r.Form.Get("published_since"), EndDate: endDate, Keyword: r.Form.Get("keyword")})
 	q := url.Values{}
 	copyProfile(q, r.Form)
 	q.Set("published_since", r.Form.Get("published_since"))
+	q.Set("published_until", endDate)
 	q.Set("keyword", r.Form.Get("keyword"))
 	if err != nil && len(items) == 0 {
 		a.logger.Printf("sync: %v", err)
@@ -278,6 +304,15 @@ func copyProfile(dst url.Values, src url.Values) {
 			dst.Set(k, v)
 		}
 	}
+}
+
+func endDateFromValues(v url.Values) string {
+	for _, key := range []string{"published_until", "end_date", "endtime"} {
+		if value := v.Get(key); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func filterKeyword(jobs []model.JobView, q string) []model.JobView {

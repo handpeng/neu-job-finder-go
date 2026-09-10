@@ -43,10 +43,12 @@ go run ./cmd/server \
   -data data/store.json \
   -base-url http://job.neu.edu.cn \
   -delay 1200ms \
-  -max-pages 100
+  -max-pages 100 \
+  -detail-workers 3 \
+  -max-connections 3
 ```
 
-请不要把 `-delay` 设置得过低。默认每个源站请求至少间隔约 1.2 秒。
+请不要把 `-delay` 设置得过低。所有列表、详情和重试请求共用一个全局 pacing gate；默认每个源站请求至少间隔约 1.2 秒，详情 worker 数不会乘大请求速率。`-max-connections` 留空时跟随 `-detail-workers`。
 
 ## 当前架构
 
@@ -61,7 +63,7 @@ Go net/http + html/template
   ├─ /export.md   Markdown
   └─ /export.csv  CSV
        ↓
-Crawler → Parser → Matcher → Local Store
+Crawler → bounded detail workers → Parser → Matcher → Local Store
        ↓
 job.neu.edu.cn public pages
 ```

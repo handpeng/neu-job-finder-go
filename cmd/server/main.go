@@ -18,6 +18,8 @@ func main() {
 	base := flag.String("base-url", "http://job.neu.edu.cn", "source site base URL")
 	delay := flag.Duration("delay", 1200*time.Millisecond, "delay between source requests")
 	maxPages := flag.Int("max-pages", 100, "maximum list pages per sync")
+	detailWorkers := flag.Int("detail-workers", 3, "maximum concurrent detail workers")
+	maxConnections := flag.Int("max-connections", 0, "maximum HTTP connections per source host; default detail-workers")
 	flag.Parse()
 
 	logger := log.New(os.Stdout, "neu-job-finder ", log.LstdFlags|log.Lmicroseconds)
@@ -25,7 +27,7 @@ func main() {
 	if err != nil {
 		logger.Fatal(err)
 	}
-	cr := crawler.New(crawler.Config{BaseURL: *base, Delay: *delay, MaxPages: *maxPages})
+	cr := crawler.New(crawler.Config{BaseURL: *base, Delay: *delay, MaxPages: *maxPages, DetailWorkers: *detailWorkers, MaxConnections: *maxConnections})
 	app, err := webapp.New(st, cr, logger)
 	if err != nil {
 		logger.Fatal(err)

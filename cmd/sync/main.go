@@ -20,6 +20,8 @@ func main() {
 	forceRefresh := flag.Bool("force-refresh", false, "refetch cached announcement details")
 	delay := flag.Duration("delay", 1200*time.Millisecond, "delay between source requests")
 	maxPages := flag.Int("max-pages", 100, "maximum list pages")
+	detailWorkers := flag.Int("detail-workers", 3, "maximum concurrent detail workers")
+	maxConnections := flag.Int("max-connections", 0, "maximum HTTP connections per source host; default detail-workers")
 	flag.Parse()
 
 	now := time.Now()
@@ -33,7 +35,7 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
-	cr := crawler.New(crawler.Config{BaseURL: *base, Delay: *delay, MaxPages: *maxPages})
+	cr := crawler.New(crawler.Config{BaseURL: *base, Delay: *delay, MaxPages: *maxPages, DetailWorkers: *detailWorkers, MaxConnections: *maxConnections})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	var summary crawler.ProgressEvent

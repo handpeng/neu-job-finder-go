@@ -84,6 +84,21 @@ job.neu.edu.cn public pages
 
 后续可将 `internal/matcher` 替换为 embedding / reranker，而不改抓取和存储层。
 
+### Boolean 查询兼容映射
+
+岗位匹配支持 `Profile.Query`：`must`、`should`、`must_not` 都是 term group 的数组。一个 group 内的 term 是 OR；多个 `must` group 之间是 AND。`minimum_should_match` 表示至少命中的 `should` group 数量；`must_not` 任一命中即排除，不能被正向命中抵消。岗位证据仍遵循 position-level provenance 隔离。
+
+例如 `A AND (B OR C)` 可以写成：
+
+```json
+{
+  "must": [["冶金", "钢铁"], ["人工智能", "机器学习"]],
+  "must_not": [["销售", "行政"]]
+}
+```
+
+为了兼容第一版，旧的 `roles`、`skills`、`research`、`major` 字段会分别映射为可选 `should` group，`minimum_should_match=0`，因此不会把旧 Profile 变成强制过滤条件。学历、城市和毕业年份仍由独立 hard-condition 逻辑处理。
+
 ## 已知边界
 
 - 网站压缩方式或 HTML 若改版，`internal/crawler` 的解码与解析器需要更新。

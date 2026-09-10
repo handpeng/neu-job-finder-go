@@ -2,6 +2,7 @@ package matcher
 
 import (
 	"neu-job-finder/internal/model"
+	"strings"
 	"testing"
 )
 
@@ -154,5 +155,98 @@ func TestShortAIDoesNotMatchEmail(t *testing.T) {
 	)
 	if v.Score == nil || *v.Score != 0 {
 		t.Fatalf("score=%v matched=%v", v.Score, v.Matched)
+	}
+}
+
+func TestBooleanTruthTable(t *testing.T) {
+	a := model.Announcement{}
+	pos := model.Position{
+		Name: "冶金算法工程师",
+		Evidence: []model.EvidenceFragment{{
+			Text:       "钢铁 机器学习 Python",
+			Provenance: model.PositionLocal,
+		}},
+	}
+	cases := []struct {
+		name  string
+		query model.BooleanQuery
+		want  bool
+	}{
+		{
+			name:  "must groups form AND and terms form OR",
+			query: model.BooleanQuery{Must: [][]string{{"冶金", "钢铁"}, {"人工智能", "机器学习"}}},
+			want:  true,
+		},
+		{
+			name:  "must miss",
+			query: model.BooleanQuery{Must: [][]string{{"行政"}}},
+			want:  false,
+		},
+		{
+			name:  "should optional",
+			query: model.BooleanQuery{Should: [][]string{{"行政"}}},
+			want:  true,
+		},
+		{
+			name:  "should threshold",
+			query: model.BooleanQuery{Should: [][]string{{"冶金"}, {"机器学习"}, {"行政"}}, MinimumShouldMatch: 3},
+			want:  false,
+		},
+		{
+			name:  "must not miss",
+			query: model.BooleanQuery{MustNot: [][]string{{"销售", "行政"}}},
+			want:  true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Evaluate(a, pos, tc.query).Eligible; got != tc.want {
+				t.Fatalf("eligible=%v, want %v; query=%#v", got, tc.want, tc.query)
+			}
+		})
+	}
+
+	excluded := Evaluate(a, model.Position{Name: "销售", Evidence: []model.EvidenceFragment{{Text: "Python", Provenance: model.PositionLocal}}}, model.BooleanQuery{
+		Should:  [][]string{{"Python"}},
+		MustNot: [][]string{{"销售"}},
+	})
+	if excluded.Eligible || len(excluded.Exclusions) != 1 {
+		t.Fatalf("MUST_NOT should fail closed: %#v", excluded)
+	}
+}
+
+func TestBooleanTermOrderDoesNotChangeEligibility(t *testing.T) {
+	a := model.Announcement{}
+	pos := model.Position{Name: "算法工程师", Evidence: []model.EvidenceFragment{{Text: "机器学习", Provenance: model.PositionLocal}}}
+	left := Evaluate(a, pos, model.BooleanQuery{
+		Must:               [][]string{{"冶金", "钢铁", "炼钢"}, {"深度学习", "机器学习"}},
+		MustNot:            [][]string{{"销售", "行政"}},
+		Should:             [][]string{{"Python", "算法工程师"}},
+		MinimumShouldMatch: 1,
+	})
+	right := Evaluate(a, pos, model.BooleanQuery{
+		Must:               [][]string{{"钢铁", "炼钢", "冶金"}, {"机器学习", "深度学习"}},
+		MustNot:            [][]string{{"行政", "销售"}},
+		Should:             [][]string{{"算法工程师", "Python"}},
+		MinimumShouldMatch: 1,
+	})
+	if left.Eligible != right.Eligible || strings.Join(left.Matched, "|") != strings.Join(right.Matched, "|") {
+		t.Fatalf("term order changed result: left=%#v right=%#v", left, right)
+	}
+}
+
+func TestBooleanAliasMatch(t *testing.T) {
+	result := Evaluate(model.Announcement{}, model.Position{Name: "算法工程师"}, model.BooleanQuery{
+		Must: [][]string{{"人工智能"}},
+	})
+	if !result.Eligible || len(result.Matched) == 0 {
+		t.Fatalf("expected alias match: %#v", result)
+	}
+}
+
+func TestLegacyProfileMapsToOptionalBooleanGroups(t *testing.T) {
+	v := Score(model.Announcement{}, model.Position{Name: "算法工程师"}, model.Profile{Roles: "算法工程师", Skills: "Python"})
+	if !v.Eligible || v.Score == nil || len(v.BooleanMatched) == 0 {
+		t.Fatalf("legacy profile compatibility failed: %#v", v)
 	}
 }

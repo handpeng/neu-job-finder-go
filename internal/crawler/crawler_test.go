@@ -354,6 +354,83 @@ func TestSyncReportsFailedDetailsSeparatelyFromAcceptedItems(t *testing.T) {
 	if partial.InRangeIDs != 2 || partial.AcceptedIDs != 1 || partial.FailedIDs != 1 || partial.FilteredIDs != 0 {
 		t.Fatalf("partial counters=%+v", partial)
 	}
+	if partial.DetailsAttempted != 2 || partial.DetailsSucceeded != 1 {
+		t.Fatalf("detail counters=%+v", partial)
+	}
+	if len(partial.FailedDetails) != 1 || partial.FailedDetails[0].ID != "201" || !strings.Contains(partial.FailedDetails[0].Reason, "404") {
+		t.Fatalf("failed details=%+v", partial.FailedDetails)
+	}
+}
+
+func TestSyncRetryIDsBypassStableCacheWithoutRefetchingOtherIDs(t *testing.T) {
+	now := time.Now()
+	date := now.Format("2006-01-02")
+	client := New(Config{BaseURL: "http://example.test", Delay: time.Nanosecond, MaxPages: 1})
+	var detailRequests []string
+	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/campus/index/" {
+			return responseFor(req, listPage(listEntryHTML("702", date))), nil
+		}
+		id := strings.TrimPrefix(req.URL.Path, "/campus/view/id/")
+		detailRequests = append(detailRequests, id)
+		return responseFor(req, detailPage(id, date)), nil
+	})
+	var summary ProgressEvent
+	items, err := client.SyncProgress(context.Background(), SyncRequest{
+		StartDate: date,
+		EndDate:   date,
+		RetryIDs:  []string{"701"},
+		CachedAnnouncements: []model.Announcement{
+			{ID: "701", PublishedDate: date, LastSeenAt: now},
+			{ID: "702", PublishedDate: date, LastSeenAt: now},
+		},
+	}, func(event ProgressEvent) error {
+		if event.Phase == "done" {
+			summary = event
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].ID != "701" {
+		t.Fatalf("retry items=%#v", items)
+	}
+	if strings.Join(detailRequests, ",") != "701" {
+		t.Fatalf("retry detail requests=%v", detailRequests)
+	}
+	if summary.NewIDs != 0 || summary.RefreshedIDs != 1 || summary.SkippedCachedIDs != 1 {
+		t.Fatalf("retry cache counters=%+v", summary)
+	}
+	if summary.DetailsAttempted != 1 || summary.DetailsSucceeded != 1 || summary.FailedIDs != 0 {
+		t.Fatalf("retry detail counters=%+v", summary)
+	}
+}
+
+func TestFinalizeCrawlRunCopiesTerminalEvidence(t *testing.T) {
+	started := time.Now().Add(-time.Minute)
+	run := model.CrawlRun{RunID: "run-test", StartedAt: started, Status: RunStatusRunning}
+	summary := ProgressEvent{
+		RunID:            run.RunID,
+		PagesScanned:     2,
+		EntriesSeen:      4,
+		UniqueIDs:        3,
+		InRangeIDs:       2,
+		DetailsAttempted: 2,
+		DetailsSucceeded: 1,
+		FailedIDs:        1,
+		FailedDetails:    []model.CrawlFailure{{ID: "702", Reason: "timeout"}},
+	}
+	final := FinalizeCrawlRun(run, summary, errors.New("partial sync: 702"), nil)
+	if final.Status != RunStatusPartial || final.RunID != run.RunID || final.FinishedAt.IsZero() {
+		t.Fatalf("final run=%+v", final)
+	}
+	if final.DetailsAttempted != 2 || final.DetailsSucceeded != 1 || len(final.FailedDetails) != 1 {
+		t.Fatalf("terminal evidence=%+v", final)
+	}
+	if final.StartedAt != started {
+		t.Fatalf("started time changed: %s", final.StartedAt)
+	}
 }
 
 func TestSyncUsesCacheAwareRefreshPolicyAndForceRefresh(t *testing.T) {

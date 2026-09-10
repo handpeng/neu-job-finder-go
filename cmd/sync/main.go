@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"neu-job-finder/internal/crawler"
@@ -22,6 +23,7 @@ func main() {
 	maxPages := flag.Int("max-pages", 100, "maximum list pages")
 	detailWorkers := flag.Int("detail-workers", 3, "maximum concurrent detail workers")
 	maxConnections := flag.Int("max-connections", 0, "maximum HTTP connections per source host; default detail-workers")
+	retryIDs := flag.String("retry-ids", "", "comma- or space-separated announcement IDs to retry")
 	flag.Parse()
 
 	now := time.Now()
@@ -38,31 +40,52 @@ func main() {
 	cr := crawler.New(crawler.Config{BaseURL: *base, Delay: *delay, MaxPages: *maxPages, DetailWorkers: *detailWorkers, MaxConnections: *maxConnections})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	var summary crawler.ProgressEvent
-	items, err := cr.SyncProgress(ctx, crawler.SyncRequest{
+	req := crawler.SyncRequest{
 		StartDate:           *start,
 		EndDate:             *end,
 		Keyword:             *keyword,
 		CachedAnnouncements: st.All(),
 		ForceRefresh:        *forceRefresh,
-	}, func(event crawler.ProgressEvent) error {
-		if event.Phase == "done" || event.Phase == "partial" {
-			summary = event
-		}
-		return nil
-	})
-	if err != nil && len(items) == 0 {
+		RetryIDs:            splitIDs(*retryIDs),
+	}
+	run := crawler.NewCrawlRun(req)
+	req.RunID = run.RunID
+	if err := st.BeginRun(run); err != nil {
 		fatal(err)
 	}
-	syncErr := err
-	ins, upd, saveErr := st.Upsert(items)
+	var summary crawler.ProgressEvent
+	items, syncErr := cr.SyncProgress(ctx, req, func(event crawler.ProgressEvent) error {
+		summary = event
+		return nil
+	})
+	run = crawler.FinalizeCrawlRun(run, summary, syncErr, ctx.Err())
+	ins, upd, saveErr := st.UpsertBatchAndFinishRun(items, run)
 	if saveErr != nil {
 		fatal(saveErr)
+	}
+	if syncErr != nil && len(items) == 0 {
+		fatal(syncErr)
 	}
 	if syncErr != nil {
 		fmt.Fprintln(os.Stderr, "WARNING:", syncErr)
 	}
-	fmt.Printf("SYNC_OK published_since=%s published_until=%s fetched=%d inserted=%d updated=%d positions=%d new=%d refreshed=%d skipped_cached=%d\n", *start, *end, len(items), ins, upd, st.CountPositions(), summary.NewIDs, summary.RefreshedIDs, summary.SkippedCachedIDs)
+	fmt.Printf("SYNC_OK run_id=%s published_since=%s published_until=%s fetched=%d inserted=%d updated=%d positions=%d new=%d refreshed=%d skipped_cached=%d details_attempted=%d details_succeeded=%d failed=%d\n", run.RunID, *start, *end, len(items), ins, upd, st.CountPositions(), summary.NewIDs, summary.RefreshedIDs, summary.SkippedCachedIDs, summary.DetailsAttempted, summary.DetailsSucceeded, summary.FailedIDs)
+}
+
+func splitIDs(value string) []string {
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == '，' || r == ';' || r == '；' || r == ' ' || r == '\t' || r == '\n'
+	})
+	seen := make(map[string]struct{}, len(parts))
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if _, ok := seen[part]; ok || part == "" {
+			continue
+		}
+		seen[part] = struct{}{}
+		out = append(out, part)
+	}
+	return out
 }
 
 func fatal(err error) {

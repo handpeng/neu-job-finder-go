@@ -91,3 +91,37 @@ type JobView struct {
 	Missing        []string        `json:"missing,omitempty"`
 	HardMismatch   []string        `json:"hard_mismatch,omitempty"`
 }
+
+type CrawlFailure struct {
+	ID     string `json:"id"`
+	Reason string `json:"reason"`
+}
+
+type CrawlRun struct {
+	RunID                string         `json:"run_id"`
+	RequestedStartDate   string         `json:"requested_start_date,omitempty"`
+	RequestedEndDate     string         `json:"requested_end_date,omitempty"`
+	Keyword              string         `json:"keyword,omitempty"`
+	RetryIDs             []string       `json:"retry_ids,omitempty"`
+	ForceRefresh         bool           `json:"force_refresh"`
+	StartedAt            time.Time      `json:"started_at"`
+	FinishedAt           time.Time      `json:"finished_at,omitempty"`
+	Status               string         `json:"status"`
+	Error                string         `json:"error,omitempty"`
+	PagesScanned         int            `json:"pages_scanned"`
+	EntriesSeen          int            `json:"entries_seen"`
+	UniqueIDs            int            `json:"unique_ids"`
+	InRangeIDs           int            `json:"in_range_ids"`
+	DuplicateIDs         int            `json:"duplicate_ids"`
+	UndatedIDs           int            `json:"undated_ids"`
+	NewIDs               int            `json:"new_ids"`
+	RefreshedIDs         int            `json:"refreshed_ids"`
+	SkippedCachedIDs     int            `json:"skipped_cached_ids"`
+	DetailsAttempted     int            `json:"details_attempted"`
+	DetailsSucceeded     int            `json:"details_succeeded"`
+	FilteredIDs          int            `json:"filtered_ids"`
+	AcceptedIDs          int            `json:"accepted_ids"`
+	FailedIDs            int            `json:"failed_ids"`
+	FailedDetails        []CrawlFailure `json:"failed_details,omitempty"`
+	CancellationObserved bool           `json:"cancellation_observed"`
+}

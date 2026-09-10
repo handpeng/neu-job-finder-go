@@ -40,6 +40,7 @@ type pageData struct {
 	StartDate     string
 	EndDate       string
 	Keyword       string
+	ForceRefresh  bool
 	Message       string
 	Error         string
 }
@@ -88,24 +89,27 @@ func (a *App) Handler() http.Handler {
 }
 
 type streamPayload struct {
-	Type         string
-	Message      string
-	Page         int
-	Current      int
-	Total        int
-	PagesScanned int
-	EntriesSeen  int
-	UniqueIDs    int
-	InRangeIDs   int
-	DuplicateIDs int
-	UndatedIDs   int
-	FilteredIDs  int
-	FailedIDs    int
-	AcceptedIDs  int
-	Company      string
-	Positions    []string
-	Inserted     int
-	Updated      int
+	Type             string
+	Message          string
+	Page             int
+	Current          int
+	Total            int
+	PagesScanned     int
+	EntriesSeen      int
+	UniqueIDs        int
+	InRangeIDs       int
+	DuplicateIDs     int
+	UndatedIDs       int
+	FilteredIDs      int
+	FailedIDs        int
+	AcceptedIDs      int
+	NewIDs           int
+	RefreshedIDs     int
+	SkippedCachedIDs int
+	Company          string
+	Positions        []string
+	Inserted         int
+	Updated          int
 }
 
 func (a *App) handleSyncStream(w http.ResponseWriter, r *http.Request) {
@@ -143,26 +147,35 @@ func (a *App) handleSyncStream(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	inserted := 0
 	updated := 0
+	var summary crawler.ProgressEvent
 	_, syncErr := a.crawler.SyncProgress(ctx, crawler.SyncRequest{
-		StartDate: r.Form.Get("published_since"),
-		EndDate:   endDateFromValues(r.Form),
-		Keyword:   r.Form.Get("keyword"),
+		StartDate:           r.Form.Get("published_since"),
+		EndDate:             endDateFromValues(r.Form),
+		Keyword:             r.Form.Get("keyword"),
+		CachedAnnouncements: a.store.All(),
+		ForceRefresh:        formTruthy(r.Form, "force_refresh"),
 	}, func(event crawler.ProgressEvent) error {
+		if event.Phase == "done" || event.Phase == "partial" {
+			summary = event
+		}
 		payload := streamPayload{
-			Type:         event.Phase,
-			Message:      event.Message,
-			Page:         event.Page,
-			Current:      event.Current,
-			Total:        event.Total,
-			PagesScanned: event.PagesScanned,
-			EntriesSeen:  event.EntriesSeen,
-			UniqueIDs:    event.UniqueIDs,
-			InRangeIDs:   event.InRangeIDs,
-			DuplicateIDs: event.DuplicateIDs,
-			UndatedIDs:   event.UndatedIDs,
-			FilteredIDs:  event.FilteredIDs,
-			FailedIDs:    event.FailedIDs,
-			AcceptedIDs:  event.AcceptedIDs,
+			Type:             event.Phase,
+			Message:          event.Message,
+			Page:             event.Page,
+			Current:          event.Current,
+			Total:            event.Total,
+			PagesScanned:     event.PagesScanned,
+			EntriesSeen:      event.EntriesSeen,
+			UniqueIDs:        event.UniqueIDs,
+			InRangeIDs:       event.InRangeIDs,
+			DuplicateIDs:     event.DuplicateIDs,
+			UndatedIDs:       event.UndatedIDs,
+			FilteredIDs:      event.FilteredIDs,
+			FailedIDs:        event.FailedIDs,
+			AcceptedIDs:      event.AcceptedIDs,
+			NewIDs:           event.NewIDs,
+			RefreshedIDs:     event.RefreshedIDs,
+			SkippedCachedIDs: event.SkippedCachedIDs,
 		}
 		if event.Announcement != nil {
 			ins, upd, err := a.store.Upsert([]model.Announcement{*event.Announcement})
@@ -183,18 +196,42 @@ func (a *App) handleSyncStream(w http.ResponseWriter, r *http.Request) {
 	if syncErr != nil {
 		a.logger.Printf("stream sync: %v", syncErr)
 		_ = send(streamPayload{
-			Type:     "error",
-			Message:  "同步停止：" + syncErr.Error(),
-			Inserted: inserted,
-			Updated:  updated,
+			Type:             "error",
+			Message:          "同步停止：" + syncErr.Error(),
+			Inserted:         inserted,
+			Updated:          updated,
+			PagesScanned:     summary.PagesScanned,
+			EntriesSeen:      summary.EntriesSeen,
+			UniqueIDs:        summary.UniqueIDs,
+			InRangeIDs:       summary.InRangeIDs,
+			DuplicateIDs:     summary.DuplicateIDs,
+			UndatedIDs:       summary.UndatedIDs,
+			FilteredIDs:      summary.FilteredIDs,
+			FailedIDs:        summary.FailedIDs,
+			AcceptedIDs:      summary.AcceptedIDs,
+			NewIDs:           summary.NewIDs,
+			RefreshedIDs:     summary.RefreshedIDs,
+			SkippedCachedIDs: summary.SkippedCachedIDs,
 		})
 		return
 	}
 	_ = send(streamPayload{
-		Type:     "complete",
-		Message:  fmt.Sprintf("同步完成：新增 %d，更新 %d。", inserted, updated),
-		Inserted: inserted,
-		Updated:  updated,
+		Type:             "complete",
+		Message:          fmt.Sprintf("同步完成：新增 %d，更新 %d。", inserted, updated),
+		Inserted:         inserted,
+		Updated:          updated,
+		PagesScanned:     summary.PagesScanned,
+		EntriesSeen:      summary.EntriesSeen,
+		UniqueIDs:        summary.UniqueIDs,
+		InRangeIDs:       summary.InRangeIDs,
+		DuplicateIDs:     summary.DuplicateIDs,
+		UndatedIDs:       summary.UndatedIDs,
+		FilteredIDs:      summary.FilteredIDs,
+		FailedIDs:        summary.FailedIDs,
+		AcceptedIDs:      summary.AcceptedIDs,
+		NewIDs:           summary.NewIDs,
+		RefreshedIDs:     summary.RefreshedIDs,
+		SkippedCachedIDs: summary.SkippedCachedIDs,
 	})
 }
 
@@ -216,7 +253,7 @@ func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	data := pageData{
 		Profile: p, Jobs: jobs, AnnouncementN: len(a.store.All()), PositionN: a.store.CountPositions(),
-		StartDate: startDate, EndDate: endDate, Keyword: r.URL.Query().Get("keyword"),
+		StartDate: startDate, EndDate: endDate, Keyword: r.URL.Query().Get("keyword"), ForceRefresh: formTruthy(r.URL.Query(), "force_refresh"),
 		Message: r.URL.Query().Get("message"), Error: r.URL.Query().Get("error"),
 	}
 	for _, j := range jobs {
@@ -237,12 +274,22 @@ func (a *App) handleSync(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 	endDate := endDateFromValues(r.Form)
-	items, err := a.crawler.Sync(ctx, crawler.SyncRequest{StartDate: r.Form.Get("published_since"), EndDate: endDate, Keyword: r.Form.Get("keyword")})
+	forceRefresh := formTruthy(r.Form, "force_refresh")
+	items, err := a.crawler.Sync(ctx, crawler.SyncRequest{
+		StartDate:           r.Form.Get("published_since"),
+		EndDate:             endDate,
+		Keyword:             r.Form.Get("keyword"),
+		CachedAnnouncements: a.store.All(),
+		ForceRefresh:        forceRefresh,
+	})
 	q := url.Values{}
 	copyProfile(q, r.Form)
 	q.Set("published_since", r.Form.Get("published_since"))
 	q.Set("published_until", endDate)
 	q.Set("keyword", r.Form.Get("keyword"))
+	if forceRefresh {
+		q.Set("force_refresh", "1")
+	}
 	if err != nil && len(items) == 0 {
 		a.logger.Printf("sync: %v", err)
 		q.Set("error", "抓取失败："+err.Error())
@@ -313,6 +360,11 @@ func endDateFromValues(v url.Values) string {
 		}
 	}
 	return ""
+}
+
+func formTruthy(v url.Values, key string) bool {
+	value := v.Get(key)
+	return value == "1" || value == "on" || strings.EqualFold(value, "true")
 }
 
 func filterKeyword(jobs []model.JobView, q string) []model.JobView {

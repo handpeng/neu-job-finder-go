@@ -139,3 +139,9 @@ go run ./cmd/sync -start 2026-09-03 -end 2026-09-30 -keyword 冶金
 ```
 
 `-keyword` 只有单个词时会传给源站；多个关键词在本地 OR 匹配。该命令适合后续接入 Windows Task Scheduler 或 cron。
+
+## 详情增量策略
+
+默认详情刷新窗口为 7 天。新发现的公告一定抓取；已缓存且源站发布日期较旧的公告默认跳过；近期公告在距离上次成功抓取超过刷新窗口后再次抓取；没有可靠发布日期的缓存项按同一窗口周期检查。`-force-refresh`（Web 中的“强制刷新已缓存详情”）会显式重新抓取当前范围内的所有缓存公告。
+
+刷新不会用抓取时间替代源站 `PublishedDate`，本地 store 会保留 `FirstSeenAt`。命令行输出和 Web 同步流会记录 `new`、`refreshed`、`skipped_cached` 计数。

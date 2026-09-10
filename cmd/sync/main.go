@@ -17,6 +17,7 @@ func main() {
 	start := flag.String("start", "", "publication start date YYYY-MM-DD; default 30 days ago")
 	end := flag.String("end", "", "publication end date YYYY-MM-DD; default today")
 	keyword := flag.String("keyword", "", "optional source keyword")
+	forceRefresh := flag.Bool("force-refresh", false, "refetch cached announcement details")
 	delay := flag.Duration("delay", 1200*time.Millisecond, "delay between source requests")
 	maxPages := flag.Int("max-pages", 100, "maximum list pages")
 	flag.Parse()
@@ -35,7 +36,19 @@ func main() {
 	cr := crawler.New(crawler.Config{BaseURL: *base, Delay: *delay, MaxPages: *maxPages})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	items, err := cr.Sync(ctx, crawler.SyncRequest{StartDate: *start, EndDate: *end, Keyword: *keyword})
+	var summary crawler.ProgressEvent
+	items, err := cr.SyncProgress(ctx, crawler.SyncRequest{
+		StartDate:           *start,
+		EndDate:             *end,
+		Keyword:             *keyword,
+		CachedAnnouncements: st.All(),
+		ForceRefresh:        *forceRefresh,
+	}, func(event crawler.ProgressEvent) error {
+		if event.Phase == "done" || event.Phase == "partial" {
+			summary = event
+		}
+		return nil
+	})
 	if err != nil && len(items) == 0 {
 		fatal(err)
 	}
@@ -47,7 +60,7 @@ func main() {
 	if syncErr != nil {
 		fmt.Fprintln(os.Stderr, "WARNING:", syncErr)
 	}
-	fmt.Printf("SYNC_OK published_since=%s published_until=%s fetched=%d inserted=%d updated=%d positions=%d\n", *start, *end, len(items), ins, upd, st.CountPositions())
+	fmt.Printf("SYNC_OK published_since=%s published_until=%s fetched=%d inserted=%d updated=%d positions=%d new=%d refreshed=%d skipped_cached=%d\n", *start, *end, len(items), ins, upd, st.CountPositions(), summary.NewIDs, summary.RefreshedIDs, summary.SkippedCachedIDs)
 }
 
 func fatal(err error) {

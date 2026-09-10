@@ -59,6 +59,52 @@ func TestAnnouncementOnlyRoleDoesNotRaiseOtherPosition(t *testing.T) {
 	}
 }
 
+func TestAnnouncementWideSemanticEvidenceIsNotInherited(t *testing.T) {
+	a := model.Announcement{
+		RawText: "冶金智能算法工程师 Python 机器学习 转炉 数据驱动；行政专员 财务专员 销售 法务",
+		Positions: []model.Position{
+			{
+				ID:     "a:1",
+				Name:   "冶金智能算法工程师",
+				Majors: "冶金工程",
+				Evidence: []model.EvidenceFragment{{
+					Text:       "Python 机器学习 转炉 数据驱动",
+					Provenance: model.PositionLocal,
+				}},
+			},
+			{ID: "a:2", Name: "行政专员"},
+		},
+	}
+	p := model.Profile{Roles: "算法工程师", Skills: "Python 机器学习", Research: "转炉 数据驱动"}
+	relevant := Score(a, a.Positions[0], p)
+	unrelated := Score(a, a.Positions[1], p)
+	if relevant.Score == nil || *relevant.Score == 0 {
+		t.Fatalf("relevant position did not receive local evidence: score=%v evidence=%v", relevant.Score, relevant.MatchEvidence)
+	}
+	if unrelated.Score == nil || *unrelated.Score != 0 || len(unrelated.MatchEvidence) != 0 {
+		t.Fatalf("unrelated position inherited announcement evidence: score=%v evidence=%v matched=%v", unrelated.Score, unrelated.MatchEvidence, unrelated.Matched)
+	}
+}
+
+func TestGenericFallbackEvidenceIsExplicitAndCapped(t *testing.T) {
+	v := Score(
+		model.Announcement{RawText: "岗位见正文：机器学习 Python"},
+		model.Position{Name: "招聘公告（岗位见正文）"},
+		model.Profile{Skills: "机器学习 Python"},
+	)
+	if len(v.MatchEvidence) == 0 {
+		t.Fatal("expected generic fallback evidence")
+	}
+	for _, evidence := range v.MatchEvidence {
+		if evidence.Provenance != model.AnnouncementGlobalFallback {
+			t.Fatalf("unexpected provenance: %#v", evidence)
+		}
+		if evidence.Confidence >= 1 {
+			t.Fatalf("generic fallback was not confidence-capped: %#v", evidence)
+		}
+	}
+}
+
 func TestGenericRecruitmentUsesAnnouncementRolesAndCities(t *testing.T) {
 	v := Score(
 		model.Announcement{

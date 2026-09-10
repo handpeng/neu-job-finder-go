@@ -30,6 +30,11 @@ const (
 	PositionFieldMajors         = "majors"
 )
 
+const (
+	PostingStatusActive  = "active"
+	PostingStatusExpired = "expired"
+)
+
 type EvidenceFragment struct {
 	Text       string             `json:"text,omitempty"`
 	Provenance EvidenceProvenance `json:"provenance"`
@@ -104,6 +109,8 @@ type Profile struct {
 type JobView struct {
 	Announcement   Announcement    `json:"announcement"`
 	Position       Position        `json:"position"`
+	Status         string          `json:"status"`
+	Expired        bool            `json:"expired"`
 	Score          *int            `json:"score,omitempty"`
 	Matched        []string        `json:"matched,omitempty"`
 	MatchEvidence  []MatchEvidence `json:"match_evidence,omitempty"`

@@ -45,7 +45,7 @@
     params.set("published_since", syncData.get("published_since") || "");
     params.set("published_until", syncData.get("published_until") || "");
     params.set("keyword", syncData.get("keyword") || "");
-    params.set("force_refresh", syncData.get("force_refresh") || "");
+    params.set("refresh_mode", syncData.get("refresh_mode") || "incremental");
     return "/?" + params.toString();
   };
 

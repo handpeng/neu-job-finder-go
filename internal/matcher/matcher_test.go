@@ -369,3 +369,47 @@ func TestBroadProfileDoesNotMechanicallyDiluteRelevantEvidence(t *testing.T) {
 		t.Fatalf("scores do not separate controls: relevant=%v unrelated=%v", jobs[0].Score, jobs[1].Score)
 	}
 }
+
+func TestResultOptionsExposeAndFilterExpiredJobs(t *testing.T) {
+	asOf := time.Date(2026, 9, 11, 8, 0, 0, 0, time.FixedZone("CST", 8*60*60))
+	items := []model.Announcement{
+		{ID: "expired", PublishedDate: "2026-09-10", ExpireDate: "2026-09-10", Positions: []model.Position{{ID: "expired:1", Name: "算法工程师"}}},
+		{ID: "today", PublishedDate: "2026-09-09", ExpireDate: "2026-09-11", Positions: []model.Position{{ID: "today:1", Name: "算法工程师"}}},
+		{ID: "unknown", PublishedDate: "2026-09-08", Positions: []model.Position{{ID: "unknown:1", Name: "算法工程师"}}},
+	}
+	all := FlattenWithOptions(items, model.Profile{}, ResultOptions{Now: asOf})
+	if len(all) != 3 || all[0].Status != model.PostingStatusExpired || !all[0].Expired {
+		t.Fatalf("unexpected status projection: %#v", all)
+	}
+	filtered := FlattenWithOptions(items, model.Profile{}, ResultOptions{Now: asOf, ExcludeExpired: true})
+	if len(filtered) != 2 {
+		t.Fatalf("expired result was not filtered: %#v", filtered)
+	}
+	for _, job := range filtered {
+		if job.Expired || job.Status != model.PostingStatusActive {
+			t.Fatalf("filtered jobs contain expired status: %#v", job)
+		}
+	}
+}
+
+func TestResultOptionsFilterBeforeTopN(t *testing.T) {
+	minimum := 0
+	items := []model.Announcement{
+		{ID: "outside", PublishedDate: "2026-08-31", Positions: []model.Position{{ID: "outside:1", Name: "算法工程师"}}},
+		{ID: "first", Company: "first", PublishedDate: "2026-09-10", Positions: []model.Position{{ID: "first:1", Name: "算法工程师"}}},
+		{ID: "second", PublishedDate: "2026-09-09", Positions: []model.Position{{ID: "second:1", Name: "算法工程师"}}},
+	}
+	jobs := FlattenWithOptions(items, model.Profile{}, ResultOptions{
+		MinScore:  &minimum,
+		TopN:      1,
+		StartDate: "2026-09-01",
+		EndDate:   "2026-09-30",
+		Search:    "first",
+	})
+	if len(jobs) != 1 || jobs[0].Announcement.ID != "first" {
+		t.Fatalf("filters were not applied before Top-N: %#v", jobs)
+	}
+	if len(items) != 3 {
+		t.Fatalf("result controls mutated source items: %d", len(items))
+	}
+}

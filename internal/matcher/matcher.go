@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"neu-job-finder/internal/model"
@@ -50,8 +51,13 @@ type BooleanResult struct {
 }
 
 type ResultOptions struct {
-	MinScore *int
-	TopN     int
+	MinScore       *int
+	TopN           int
+	ExcludeExpired bool
+	StartDate      string
+	EndDate        string
+	Search         string
+	Now            time.Time
 }
 
 func Flatten(items []model.Announcement, p model.Profile) []model.JobView {
@@ -60,18 +66,37 @@ func Flatten(items []model.Announcement, p model.Profile) []model.JobView {
 
 func FlattenWithOptions(items []model.Announcement, p model.Profile, options ResultOptions) []model.JobView {
 	options = normalizeResultOptions(options)
+	now := options.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
 	out := []model.JobView{}
 	for _, a := range items {
 		for _, pos := range a.Positions {
-			v := Score(a, pos, p)
+			v := scoreAt(a, pos, p, now)
 			if !v.Eligible {
 				continue
 			}
 			if p.Strict && len(v.HardMismatch) > 0 {
 				continue
 			}
-			if options.MinScore != nil && (v.Score == nil || *v.Score < *options.MinScore) {
+			if options.ExcludeExpired && v.Expired {
 				continue
+			}
+			if !publishedInRange(a.PublishedDate, options.StartDate, options.EndDate) {
+				continue
+			}
+			if !matchesSearch(v, options.Search) {
+				continue
+			}
+			if options.MinScore != nil {
+				if v.Score == nil {
+					if *options.MinScore > 0 {
+						continue
+					}
+				} else if *v.Score < *options.MinScore {
+					continue
+				}
 			}
 			out = append(out, v)
 		}
@@ -122,7 +147,12 @@ func stableID(v model.JobView) string {
 }
 
 func Score(a model.Announcement, pos model.Position, p model.Profile) model.JobView {
-	v := model.JobView{Announcement: a, Position: pos, Eligible: true}
+	return scoreAt(a, pos, p, time.Now())
+}
+
+func scoreAt(a model.Announcement, pos model.Position, p model.Profile, now time.Time) model.JobView {
+	status, expired := postingStatus(a.ExpireDate, now)
+	v := model.JobView{Announcement: a, Position: pos, Status: status, Expired: expired, Eligible: true}
 	generic := isGenericPosition(pos.Name, a.Company)
 	positionText := positionText(pos)
 	positionSources := positionEvidence(positionText, pos, a.RawText, generic)
@@ -188,6 +218,51 @@ func Score(a model.Announcement, pos model.Position, p model.Profile) model.JobV
 		v.Score = &s
 	}
 	return v
+}
+
+func postingStatus(expireDate string, now time.Time) (string, bool) {
+	expireDate = strings.TrimSpace(expireDate)
+	if expireDate == "" {
+		return model.PostingStatusActive, false
+	}
+	if _, err := time.Parse("2006-01-02", expireDate); err != nil {
+		return model.PostingStatusActive, false
+	}
+	if expireDate < now.Format("2006-01-02") {
+		return model.PostingStatusExpired, true
+	}
+	return model.PostingStatusActive, false
+}
+
+func publishedInRange(date, start, end string) bool {
+	if date == "" {
+		return true
+	}
+	if start != "" && date < start {
+		return false
+	}
+	if end != "" && date > end {
+		return false
+	}
+	return true
+}
+
+func matchesSearch(v model.JobView, search string) bool {
+	search = strings.TrimSpace(strings.ToLower(search))
+	if search == "" {
+		return true
+	}
+	haystack := strings.ToLower(strings.Join([]string{
+		v.Announcement.Company,
+		v.Announcement.PublishedDate,
+		v.Announcement.ExpireDate,
+		v.Announcement.CommonText,
+		v.Announcement.RawText,
+		v.Position.Name,
+		v.Position.Location,
+		v.Position.Majors,
+	}, " "))
+	return strings.Contains(haystack, search)
 }
 
 func Evaluate(a model.Announcement, pos model.Position, query model.BooleanQuery) BooleanResult {

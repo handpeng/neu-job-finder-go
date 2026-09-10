@@ -17,6 +17,10 @@
 - 研究方向、技能、学历、毕业年份、专业、意向城市、意向岗位 **全部可选**。
 - 无个人条件时不生成虚假匹配分；有条件时只使用已填写项评分。
 - “严格过滤”开关：可隐藏学历、城市、明确毕业届别等硬条件不匹配岗位。
+- Web、JSON API 和 CSV/Markdown/XLSX 导出共用同一组 Boolean、日期、最低分、Top-N、搜索和过期过滤结果管线。
+- Web 支持 `MUST`、`SHOULD`、`MUST_NOT`；每行是一个组，组内词语 OR，`MUST` 各组 AND，`SHOULD` 由 `minimum_should_match` 控制。
+- 岗位结果明确标记 `active`/`expired`；排除过期岗位只影响结果视图，不删除本地原始缓存。
+- `/api/runs` 和 `/api/runs/{run_id}` 提供最近同步的请求范围、计数、失败 ID 和终态。
 - 本地 JSON 原子持久化，无数据库/Node/第三方 Go 依赖。
 - Excel (`.xlsx`)、Markdown、CSV 导出。
 - Go 原生 server-rendered UI，适合本地快速运行与后续拆分。
@@ -48,7 +52,8 @@ go run ./cmd/server \
   -delay 1200ms \
   -max-pages 100 \
   -detail-workers 3 \
-  -max-connections 3
+  -max-connections 3 \
+  -refresh-mode incremental
 ```
 
 请不要把 `-delay` 设置得过低。所有列表、详情和重试请求共用一个全局 pacing gate；默认每个源站请求至少间隔约 1.2 秒，详情 worker 数不会乘大请求速率。`-max-connections` 留空时跟随 `-detail-workers`。
@@ -62,6 +67,7 @@ Go net/http + html/template
   ├─ /            岗位列表 / 可选匹配条件
   ├─ /sync        低频增量抓取
   ├─ /api/jobs    JSON API
+  ├─ /api/runs    crawl run 状态
   ├─ /export.xlsx Excel
   ├─ /export.md   Markdown
   └─ /export.csv  CSV
@@ -110,6 +116,12 @@ job.neu.edu.cn public pages
 
 排名顺序固定为：`score DESC`、源站 `PublishedDate DESC`、岗位稳定 ID 升序。`LastSeenAt` 只表示本地抓取时间，不参与岗位新鲜度排名。
 
+### Web/API/导出参数
+
+结果接口接受相同的参数：`must`、`should`、`must_not`（可重复传入，每个值是一组；组内用 `|` 或逗号分隔词语），`minimum_should_match`、`min_score`、`top_n`、`exclude_expired`、`published_since`、`published_until` 和 `q`。也可以用 `query` 传入 `BooleanQuery` JSON。`/api/jobs` 返回 JSON 岗位数组，三个导出接口只改变格式，不改变过滤和排序后的岗位集合。
+
+详情刷新属于同步控制，不改变结果过滤：默认 `refresh_mode=incremental`，新公告必抓、稳定旧缓存跳过；`refresh_mode=force` 或 CLI 的 `-force-refresh` 会刷新当前范围内的缓存详情。CLI 同时支持 `-start` 和 `-end` 的包含边界日期。
+
 ## 已知边界
 
 - 网站压缩方式或 HTML 若改版，`internal/crawler` 的解码与解析器需要更新。
@@ -120,6 +132,7 @@ job.neu.edu.cn public pages
 - 抓取关键词与岗位 Boolean 匹配分开处理：单个关键词会作为 `keyword` 传给源站；多个以空格、逗号、分号、顿号或 `|` 分隔的关键词不会拼成源站表达式，而是在详情的公司、正文和岗位字段中执行本地 OR 匹配。
 - 每次同步的进度包含 `EntriesSeen`、`UniqueIDs`、`InRangeIDs`、`DuplicateIDs`、`UndatedIDs`、`FilteredIDs`、`FailedIDs` 和 `AcceptedIDs`，用于核对发现与结果数量。
 - 缺失、乱序或多余的岗位元数据不会仅按列序静默填入；无法确认的字段保持为空并标记为 `ambiguous`。matcher 会跳过这类字段的 verified 证据，同时保留原始详情 URL 和岗位行文本供人工核对。
+- Web 的实际嵌入资源唯一位于 `internal/webapp/web/`；根目录不再保留未使用的重复资源树。CI 在 PR 和主分支 push 上运行 gofmt、vet、完整测试和 race 测试。
 
 ## 下一阶段建议
 

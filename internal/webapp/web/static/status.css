@@ -1,0 +1,62 @@
+.run-status {
+  padding: 14px 16px;
+  margin-bottom: 12px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 14px;
+  align-items: center;
+}
+
+.run-status div {
+  min-width: 0;
+}
+
+.run-status small,
+.run-status strong,
+.run-status span {
+  display: block;
+}
+
+.run-status small {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+
+.run-status strong {
+  margin-top: 2px;
+}
+
+.run-status span {
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.run-status a {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.status {
+  font-weight: 700;
+}
+
+.status.active {
+  background: #e1f0e6;
+  color: #286443;
+}
+
+.status.expired {
+  background: #f4dfdc;
+  color: #8b3d34;
+}
+
+@media (max-width: 640px) {
+  .run-status {
+    grid-template-columns: 1fr;
+  }
+}

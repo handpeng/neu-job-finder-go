@@ -40,11 +40,22 @@ type evidenceSource struct {
 	confidence float64
 }
 
+type BooleanResult struct {
+	Eligible   bool
+	Matched    []string
+	Missing    []string
+	Exclusions []string
+	Evidence   []model.MatchEvidence
+}
+
 func Flatten(items []model.Announcement, p model.Profile) []model.JobView {
 	out := []model.JobView{}
 	for _, a := range items {
 		for _, pos := range a.Positions {
 			v := Score(a, pos, p)
+			if !v.Eligible {
+				continue
+			}
 			if p.Strict && len(v.HardMismatch) > 0 {
 				continue
 			}
@@ -67,7 +78,7 @@ func Flatten(items []model.Announcement, p model.Profile) []model.JobView {
 }
 
 func Score(a model.Announcement, pos model.Position, p model.Profile) model.JobView {
-	v := model.JobView{Announcement: a, Position: pos}
+	v := model.JobView{Announcement: a, Position: pos, Eligible: true}
 	generic := isGenericPosition(pos.Name, a.Company)
 	positionText := strings.Join([]string{pos.Name, pos.Salary, pos.Location, pos.EmploymentType, pos.Degree, pos.Majors}, " ")
 	positionSources := positionEvidence(positionText, pos, a.RawText, generic)
@@ -76,6 +87,19 @@ func Score(a model.Announcement, pos model.Position, p model.Profile) model.JobV
 	citySources := append([]evidenceSource{}, positionEvidence(pos.Location+" "+pos.Name, pos, a.RawText, generic)...)
 	if strings.TrimSpace(a.CommonText) != "" {
 		citySources = append(citySources, evidenceSource{text: a.CommonText, provenance: model.AnnouncementCommon, confidence: 1})
+	}
+	boolean := Evaluate(a, pos, p.Query)
+	if !p.Query.HasClauses() {
+		boolean = Evaluate(a, pos, legacyQuery(p))
+	}
+	v.Eligible = boolean.Eligible
+	v.BooleanMatched = append(v.BooleanMatched, boolean.Matched...)
+	v.BooleanMissing = append(v.BooleanMissing, boolean.Missing...)
+	v.Exclusions = append(v.Exclusions, boolean.Exclusions...)
+	v.MatchEvidence = append(v.MatchEvidence, boolean.Evidence...)
+	if !boolean.Eligible {
+		v.HardMismatch = append(v.HardMismatch, boolean.Missing...)
+		v.HardMismatch = append(v.HardMismatch, boolean.Exclusions...)
 	}
 	fields := []fieldScore{
 		semanticField("意向岗位", p.Roles, roleSources, 25),
@@ -116,6 +140,123 @@ func Score(a model.Announcement, pos model.Position, p model.Profile) model.JobV
 		v.Score = &s
 	}
 	return v
+}
+
+func Evaluate(a model.Announcement, pos model.Position, query model.BooleanQuery) BooleanResult {
+	query = normalizeQuery(query)
+	result := BooleanResult{Eligible: true}
+	if query.MinimumShouldMatch < 0 || query.MinimumShouldMatch > len(query.Should) {
+		result.Eligible = false
+		result.Missing = append(result.Missing, fmt.Sprintf("minimum_should_match 无效：需要 0 到 %d 个 SHOULD 组", len(query.Should)))
+		return result
+	}
+	sources := booleanEvidence(a, pos)
+	for i, group := range query.Must {
+		hits := groupHits(sources, group)
+		result.Evidence = append(result.Evidence, hits...)
+		if len(hits) == 0 {
+			result.Eligible = false
+			result.Missing = append(result.Missing, fmt.Sprintf("MUST[%d] 未命中：%s", i+1, strings.Join(group, " OR ")))
+			continue
+		}
+		result.Matched = append(result.Matched, fmt.Sprintf("MUST[%d] 命中：%s", i+1, evidenceTerms(hits)))
+	}
+
+	shouldMatches := 0
+	for i, group := range query.Should {
+		hits := groupHits(sources, group)
+		result.Evidence = append(result.Evidence, hits...)
+		if len(hits) == 0 {
+			continue
+		}
+		shouldMatches++
+		result.Matched = append(result.Matched, fmt.Sprintf("SHOULD[%d] 命中：%s", i+1, evidenceTerms(hits)))
+	}
+	if shouldMatches < query.MinimumShouldMatch {
+		result.Eligible = false
+		result.Missing = append(result.Missing, fmt.Sprintf("SHOULD 仅命中 %d/%d 组，至少需要 %d 组", shouldMatches, len(query.Should), query.MinimumShouldMatch))
+	}
+
+	for i, group := range query.MustNot {
+		hits := groupHits(sources, group)
+		if len(hits) == 0 {
+			continue
+		}
+		result.Eligible = false
+		result.Evidence = append(result.Evidence, hits...)
+		result.Exclusions = append(result.Exclusions, fmt.Sprintf("MUST_NOT[%d] 命中：%s", i+1, evidenceTerms(hits)))
+	}
+	return result
+}
+
+func booleanEvidence(a model.Announcement, pos model.Position) []evidenceSource {
+	primary := strings.Join([]string{pos.Name, pos.Salary, pos.Location, pos.EmploymentType, pos.Degree, pos.Majors}, " ")
+	return positionEvidence(primary, pos, a.RawText, isGenericPosition(pos.Name, a.Company))
+}
+
+func legacyQuery(p model.Profile) model.BooleanQuery {
+	groups := make([][]string, 0, 4)
+	for _, value := range []string{p.Roles, p.Skills, p.Research, p.Major} {
+		if strings.TrimSpace(value) != "" {
+			groups = append(groups, []string{value})
+		}
+	}
+	return model.BooleanQuery{Should: groups}
+}
+
+func normalizeQuery(query model.BooleanQuery) model.BooleanQuery {
+	query.Must = normalizeGroups(query.Must)
+	query.Should = normalizeGroups(query.Should)
+	query.MustNot = normalizeGroups(query.MustNot)
+	return query
+}
+
+func normalizeGroups(groups [][]string) [][]string {
+	out := make([][]string, 0, len(groups))
+	for _, group := range groups {
+		seen := map[string]bool{}
+		termsInGroup := make([]string, 0, len(group))
+		for _, raw := range group {
+			for _, term := range terms(raw) {
+				key := strings.ToLower(term)
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				termsInGroup = append(termsInGroup, term)
+			}
+		}
+		sort.Slice(termsInGroup, func(i, j int) bool {
+			return strings.ToLower(termsInGroup[i]) < strings.ToLower(termsInGroup[j])
+		})
+		if len(termsInGroup) > 0 {
+			out = append(out, termsInGroup)
+		}
+	}
+	return out
+}
+
+func groupHits(sources []evidenceSource, group []string) []model.MatchEvidence {
+	hits := make([]model.MatchEvidence, 0, len(group))
+	for _, term := range group {
+		if source, ok := bestEvidence(sources, term); ok {
+			hits = append(hits, model.MatchEvidence{
+				Field:      "BOOLEAN",
+				Term:       term,
+				Provenance: source.provenance,
+				Confidence: source.confidence,
+			})
+		}
+	}
+	return hits
+}
+
+func evidenceTerms(hits []model.MatchEvidence) string {
+	terms := make([]string, 0, len(hits))
+	for _, hit := range hits {
+		terms = append(terms, hit.Term)
+	}
+	return strings.Join(terms, "、")
 }
 
 func positionEvidence(primary string, pos model.Position, fallback string, allowFallback bool) []evidenceSource {

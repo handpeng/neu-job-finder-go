@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -64,6 +65,8 @@ type SyncRequest struct {
 	Keyword             string
 	CachedAnnouncements []model.Announcement
 	ForceRefresh        bool
+	RunID               string
+	RetryIDs            []string
 }
 
 type Client struct {
@@ -94,7 +97,79 @@ func (p *requestPacer) wait(ctx context.Context) error {
 
 var ErrSyncInProgress = errors.New("a sync is already in progress")
 
+const (
+	RunStatusRunning   = "running"
+	RunStatusCompleted = "completed"
+	RunStatusPartial   = "partial"
+	RunStatusFailed    = "failed"
+	RunStatusCanceled  = "canceled"
+)
+
+var runSequence uint64
+
+func NewCrawlRun(req SyncRequest) model.CrawlRun {
+	runID := req.RunID
+	if runID == "" {
+		runID = NewRunID()
+	}
+	return model.CrawlRun{
+		RunID:              runID,
+		RequestedStartDate: req.StartDate,
+		RequestedEndDate:   req.EndDate,
+		Keyword:            req.Keyword,
+		RetryIDs:           append([]string(nil), req.RetryIDs...),
+		ForceRefresh:       req.ForceRefresh,
+		StartedAt:          time.Now().UTC(),
+		Status:             RunStatusRunning,
+	}
+}
+
+func NewRunID() string {
+	sequence := atomic.AddUint64(&runSequence, 1)
+	return fmt.Sprintf("run-%s-%d", time.Now().UTC().Format("20060102T150405.000000000Z"), sequence)
+}
+
+func FinalizeCrawlRun(run model.CrawlRun, summary ProgressEvent, syncErr error, ctxErr error) model.CrawlRun {
+	if summary.RunID != "" {
+		run.RunID = summary.RunID
+	}
+	run.PagesScanned = summary.PagesScanned
+	run.EntriesSeen = summary.EntriesSeen
+	run.UniqueIDs = summary.UniqueIDs
+	run.InRangeIDs = summary.InRangeIDs
+	run.DuplicateIDs = summary.DuplicateIDs
+	run.UndatedIDs = summary.UndatedIDs
+	run.NewIDs = summary.NewIDs
+	run.RefreshedIDs = summary.RefreshedIDs
+	run.SkippedCachedIDs = summary.SkippedCachedIDs
+	run.DetailsAttempted = summary.DetailsAttempted
+	run.DetailsSucceeded = summary.DetailsSucceeded
+	run.FilteredIDs = summary.FilteredIDs
+	run.AcceptedIDs = summary.AcceptedIDs
+	run.FailedIDs = summary.FailedIDs
+	run.FailedDetails = append([]model.CrawlFailure(nil), summary.FailedDetails...)
+	run.CancellationObserved = ctxErr != nil
+	run.FinishedAt = time.Now().UTC()
+	switch {
+	case ctxErr != nil:
+		run.Status = RunStatusCanceled
+	case syncErr == nil:
+		run.Status = RunStatusCompleted
+	case summary.FailedIDs > 0:
+		run.Status = RunStatusPartial
+	default:
+		run.Status = RunStatusFailed
+	}
+	if syncErr != nil {
+		run.Error = syncErr.Error()
+	} else {
+		run.Error = ""
+	}
+	return run
+}
+
 type ProgressEvent struct {
+	RunID            string
 	Phase            string
 	Page             int
 	Current          int
@@ -111,6 +186,9 @@ type ProgressEvent struct {
 	NewIDs           int
 	RefreshedIDs     int
 	SkippedCachedIDs int
+	DetailsAttempted int
+	DetailsSucceeded int
+	FailedDetails    []model.CrawlFailure
 	Announcement     *model.Announcement
 	Message          string
 }
@@ -136,6 +214,36 @@ type discoveryStats struct {
 	NewIDs           int
 	RefreshedIDs     int
 	SkippedCachedIDs int
+	DetailsAttempted int
+	DetailsSucceeded int
+	FailedDetails    []model.CrawlFailure
+}
+
+func (s discoveryStats) progress(runID, phase string, page, current, total int, announcement *model.Announcement, message string) ProgressEvent {
+	return ProgressEvent{
+		RunID:            runID,
+		Phase:            phase,
+		Page:             page,
+		Current:          current,
+		Total:            total,
+		PagesScanned:     s.PagesScanned,
+		EntriesSeen:      s.EntriesSeen,
+		UniqueIDs:        s.UniqueIDs,
+		InRangeIDs:       s.InRangeIDs,
+		DuplicateIDs:     s.DuplicateIDs,
+		UndatedIDs:       s.UndatedIDs,
+		FilteredIDs:      s.FilteredIDs,
+		FailedIDs:        s.FailedIDs,
+		AcceptedIDs:      s.AcceptedIDs,
+		NewIDs:           s.NewIDs,
+		RefreshedIDs:     s.RefreshedIDs,
+		SkippedCachedIDs: s.SkippedCachedIDs,
+		DetailsAttempted: s.DetailsAttempted,
+		DetailsSucceeded: s.DetailsSucceeded,
+		FailedDetails:    append([]model.CrawlFailure(nil), s.FailedDetails...),
+		Announcement:     announcement,
+		Message:          message,
+	}
 }
 
 func New(cfg Config) *Client {
@@ -187,6 +295,9 @@ func (c *Client) SyncProgress(ctx context.Context, req SyncRequest, progress Pro
 		return nil, ErrSyncInProgress
 	}
 	defer c.syncMu.Unlock()
+	if req.RunID == "" {
+		req.RunID = NewRunID()
+	}
 	if err := validateSyncRequest(req); err != nil {
 		return nil, err
 	}
@@ -196,6 +307,13 @@ func (c *Client) SyncProgress(ctx context.Context, req SyncRequest, progress Pro
 	undatedIDs := make(map[string]struct{})
 	keywords := splitKeywords(req.Keyword)
 	stats := discoveryStats{}
+	retryIDs := make(map[string]struct{}, len(req.RetryIDs))
+	for _, id := range req.RetryIDs {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			retryIDs[id] = struct{}{}
+		}
+	}
 	cachedByID := make(map[string]model.Announcement, len(req.CachedAnnouncements))
 	for _, cached := range req.CachedAnnouncements {
 		if cached.ID != "" {
@@ -235,30 +353,19 @@ func (c *Client) SyncProgress(ctx context.Context, req SyncRequest, progress Pro
 		stats.PagesScanned = page
 		stats.UniqueIDs = len(seenIDs)
 		stats.InRangeIDs = len(entriesByID)
-		if err := emitProgress(progress, ProgressEvent{
-			Phase:            "discovering",
-			Page:             page,
-			Total:            len(entriesByID),
-			PagesScanned:     stats.PagesScanned,
-			EntriesSeen:      stats.EntriesSeen,
-			UniqueIDs:        stats.UniqueIDs,
-			InRangeIDs:       stats.InRangeIDs,
-			DuplicateIDs:     stats.DuplicateIDs,
-			UndatedIDs:       stats.UndatedIDs,
-			FilteredIDs:      stats.FilteredIDs,
-			FailedIDs:        stats.FailedIDs,
-			AcceptedIDs:      stats.AcceptedIDs,
-			NewIDs:           stats.NewIDs,
-			RefreshedIDs:     stats.RefreshedIDs,
-			SkippedCachedIDs: stats.SkippedCachedIDs,
-			Message:          fmt.Sprintf("已扫描第 %d 页，发现 %d 条待抓取公告", page, len(entriesByID)),
-		}); err != nil {
+		if err := emitProgress(progress, stats.progress(req.RunID, "discovering", page, 0, len(entriesByID), nil, fmt.Sprintf("已扫描第 %d 页，发现 %d 条待抓取公告", page, len(entriesByID)))); err != nil {
 			return nil, err
 		}
 		if pageIsOlderThan(pageEntries, req.StartDate) {
 			break
 		}
 	}
+	for id := range retryIDs {
+		if _, ok := entriesByID[id]; !ok {
+			entriesByID[id] = listEntry{ID: id}
+		}
+	}
+	stats.InRangeIDs = len(entriesByID)
 
 	ordered := make([]string, 0, len(entriesByID))
 	for id := range entriesByID {
@@ -275,70 +382,38 @@ func (c *Client) SyncProgress(ctx context.Context, req SyncRequest, progress Pro
 	detailIDs := make([]string, 0, len(ordered))
 	policyNow := time.Now()
 	for i, id := range ordered {
+		_, retry := retryIDs[id]
 		cached, ok := cachedByID[id]
 		if !ok {
 			stats.NewIDs++
 			detailIDs = append(detailIDs, id)
 			continue
 		}
-		if req.ForceRefresh || cachedDetailNeedsRefresh(cached, policyNow, c.cfg.RefreshWindow) {
+		if retry || req.ForceRefresh || cachedDetailNeedsRefresh(cached, policyNow, c.cfg.RefreshWindow) {
 			stats.RefreshedIDs++
 			detailIDs = append(detailIDs, id)
 			continue
 		}
 		stats.SkippedCachedIDs++
-		if err := emitProgress(progress, ProgressEvent{
-			Phase:            "cached",
-			Current:          i + 1,
-			Total:            len(ordered),
-			PagesScanned:     stats.PagesScanned,
-			EntriesSeen:      stats.EntriesSeen,
-			UniqueIDs:        stats.UniqueIDs,
-			InRangeIDs:       stats.InRangeIDs,
-			DuplicateIDs:     stats.DuplicateIDs,
-			UndatedIDs:       stats.UndatedIDs,
-			FilteredIDs:      stats.FilteredIDs,
-			FailedIDs:        stats.FailedIDs,
-			AcceptedIDs:      stats.AcceptedIDs,
-			NewIDs:           stats.NewIDs,
-			RefreshedIDs:     stats.RefreshedIDs,
-			SkippedCachedIDs: stats.SkippedCachedIDs,
-			Message:          fmt.Sprintf("公告 %s 已有稳定缓存，跳过详情抓取", id),
-		}); err != nil {
+		if err := emitProgress(progress, stats.progress(req.RunID, "cached", 0, i+1, len(ordered), nil, fmt.Sprintf("公告 %s 已有稳定缓存，跳过详情抓取", id))); err != nil {
 			return nil, err
 		}
 	}
 
 	out := make([]model.Announcement, 0, len(detailIDs))
-	failed := make([]string, 0)
+	stats.DetailsAttempted = len(detailIDs)
 	detailResults := c.fetchDetails(ctx, detailIDs)
 	for i, result := range detailResults {
 		id := result.id
 		body, detailURL, err := result.body, result.detailURL, result.err
 		if err != nil {
-			failed = append(failed, fmt.Sprintf("%s: %v", id, err))
-			stats.FailedIDs++
-			if err := emitProgress(progress, ProgressEvent{
-				Phase:            "failed",
-				Current:          i + 1,
-				Total:            len(detailIDs),
-				PagesScanned:     stats.PagesScanned,
-				EntriesSeen:      stats.EntriesSeen,
-				UniqueIDs:        stats.UniqueIDs,
-				InRangeIDs:       stats.InRangeIDs,
-				DuplicateIDs:     stats.DuplicateIDs,
-				UndatedIDs:       stats.UndatedIDs,
-				FilteredIDs:      stats.FilteredIDs,
-				FailedIDs:        stats.FailedIDs,
-				AcceptedIDs:      stats.AcceptedIDs,
-				NewIDs:           stats.NewIDs,
-				RefreshedIDs:     stats.RefreshedIDs,
-				SkippedCachedIDs: stats.SkippedCachedIDs,
-				Message:          fmt.Sprintf("公告 %s 详情抓取失败", id),
-			}); err != nil {
+			stats.FailedDetails = append(stats.FailedDetails, model.CrawlFailure{ID: id, Reason: err.Error()})
+			stats.FailedIDs = len(stats.FailedDetails)
+			if err := emitProgress(progress, stats.progress(req.RunID, "failed", 0, i+1, len(detailIDs), nil, fmt.Sprintf("公告 %s 详情抓取失败", id))); err != nil {
 				return out, err
 			}
 		} else {
+			stats.DetailsSucceeded++
 			a := parseDetail(id, detailURL, body)
 			if a.PublishedDate == "" {
 				a.PublishedDate = entriesByID[id].PublishedDate
@@ -348,24 +423,7 @@ func (c *Client) SyncProgress(ctx context.Context, req SyncRequest, progress Pro
 			}
 			if !publishedInRange(a.PublishedDate, req.StartDate, req.EndDate) {
 				stats.FilteredIDs++
-				if err := emitProgress(progress, ProgressEvent{
-					Phase:            "filtered",
-					Current:          i + 1,
-					Total:            len(detailIDs),
-					PagesScanned:     stats.PagesScanned,
-					EntriesSeen:      stats.EntriesSeen,
-					UniqueIDs:        stats.UniqueIDs,
-					InRangeIDs:       stats.InRangeIDs,
-					DuplicateIDs:     stats.DuplicateIDs,
-					UndatedIDs:       stats.UndatedIDs,
-					FilteredIDs:      stats.FilteredIDs,
-					FailedIDs:        stats.FailedIDs,
-					AcceptedIDs:      stats.AcceptedIDs,
-					NewIDs:           stats.NewIDs,
-					RefreshedIDs:     stats.RefreshedIDs,
-					SkippedCachedIDs: stats.SkippedCachedIDs,
-					Message:          "详情发布日期不在请求区间，已跳过",
-				}); err != nil {
+				if err := emitProgress(progress, stats.progress(req.RunID, "filtered", 0, i+1, len(detailIDs), nil, "详情发布日期不在请求区间，已跳过")); err != nil {
 					return out, err
 				}
 				continue
@@ -373,96 +431,31 @@ func (c *Client) SyncProgress(ctx context.Context, req SyncRequest, progress Pro
 			if announcementMatchesKeywords(a, keywords) {
 				out = append(out, a)
 				stats.AcceptedIDs++
-				if err := emitProgress(progress, ProgressEvent{
-					Phase:            "item",
-					Current:          i + 1,
-					Total:            len(detailIDs),
-					PagesScanned:     stats.PagesScanned,
-					EntriesSeen:      stats.EntriesSeen,
-					UniqueIDs:        stats.UniqueIDs,
-					InRangeIDs:       stats.InRangeIDs,
-					DuplicateIDs:     stats.DuplicateIDs,
-					UndatedIDs:       stats.UndatedIDs,
-					FilteredIDs:      stats.FilteredIDs,
-					FailedIDs:        stats.FailedIDs,
-					AcceptedIDs:      stats.AcceptedIDs,
-					NewIDs:           stats.NewIDs,
-					RefreshedIDs:     stats.RefreshedIDs,
-					SkippedCachedIDs: stats.SkippedCachedIDs,
-					Announcement:     &a,
-					Message:          fmt.Sprintf("已抓取 %s", a.Company),
-				}); err != nil {
+				if err := emitProgress(progress, stats.progress(req.RunID, "item", 0, i+1, len(detailIDs), &a, fmt.Sprintf("已抓取 %s", a.Company))); err != nil {
 					return out, err
 				}
 			} else {
 				stats.FilteredIDs++
-				if err := emitProgress(progress, ProgressEvent{
-					Phase:            "progress",
-					Current:          i + 1,
-					Total:            len(detailIDs),
-					PagesScanned:     stats.PagesScanned,
-					EntriesSeen:      stats.EntriesSeen,
-					UniqueIDs:        stats.UniqueIDs,
-					InRangeIDs:       stats.InRangeIDs,
-					DuplicateIDs:     stats.DuplicateIDs,
-					UndatedIDs:       stats.UndatedIDs,
-					FilteredIDs:      stats.FilteredIDs,
-					FailedIDs:        stats.FailedIDs,
-					AcceptedIDs:      stats.AcceptedIDs,
-					NewIDs:           stats.NewIDs,
-					RefreshedIDs:     stats.RefreshedIDs,
-					SkippedCachedIDs: stats.SkippedCachedIDs,
-					Message:          "公告与抓取关键词不匹配，已跳过",
-				}); err != nil {
+				if err := emitProgress(progress, stats.progress(req.RunID, "progress", 0, i+1, len(detailIDs), nil, "公告与抓取关键词不匹配，已跳过")); err != nil {
 					return out, err
 				}
 			}
 		}
 	}
-	if len(failed) > 0 {
-		if err := emitProgress(progress, ProgressEvent{
-			Phase:            "partial",
-			Current:          len(detailIDs),
-			Total:            len(detailIDs),
-			PagesScanned:     stats.PagesScanned,
-			EntriesSeen:      stats.EntriesSeen,
-			UniqueIDs:        stats.UniqueIDs,
-			InRangeIDs:       stats.InRangeIDs,
-			DuplicateIDs:     stats.DuplicateIDs,
-			UndatedIDs:       stats.UndatedIDs,
-			FilteredIDs:      stats.FilteredIDs,
-			FailedIDs:        stats.FailedIDs,
-			AcceptedIDs:      stats.AcceptedIDs,
-			NewIDs:           stats.NewIDs,
-			RefreshedIDs:     stats.RefreshedIDs,
-			SkippedCachedIDs: stats.SkippedCachedIDs,
-			Message:          fmt.Sprintf("同步部分完成，成功 %d 条，失败 %d 条", stats.AcceptedIDs, stats.FailedIDs),
-		}); err != nil {
+	if len(stats.FailedDetails) > 0 {
+		if err := emitProgress(progress, stats.progress(req.RunID, "partial", 0, len(detailIDs), len(detailIDs), nil, fmt.Sprintf("同步部分完成，成功 %d 条，失败 %d 条", stats.AcceptedIDs, stats.FailedIDs))); err != nil {
 			return out, err
 		}
-		if len(failed) > 3 {
-			failed = append(failed[:3], fmt.Sprintf("and %d more", len(failed)-3))
+		failureMessages := make([]string, 0, len(stats.FailedDetails))
+		for _, failure := range stats.FailedDetails {
+			failureMessages = append(failureMessages, fmt.Sprintf("%s: %s", failure.ID, failure.Reason))
 		}
-		return out, fmt.Errorf("partial sync: %s", strings.Join(failed, "; "))
+		if len(failureMessages) > 3 {
+			failureMessages = append(failureMessages[:3], fmt.Sprintf("and %d more", len(failureMessages)-3))
+		}
+		return out, fmt.Errorf("partial sync: %s", strings.Join(failureMessages, "; "))
 	}
-	if err := emitProgress(progress, ProgressEvent{
-		Phase:            "done",
-		Current:          len(detailIDs),
-		Total:            len(detailIDs),
-		PagesScanned:     stats.PagesScanned,
-		EntriesSeen:      stats.EntriesSeen,
-		UniqueIDs:        stats.UniqueIDs,
-		InRangeIDs:       stats.InRangeIDs,
-		DuplicateIDs:     stats.DuplicateIDs,
-		UndatedIDs:       stats.UndatedIDs,
-		FilteredIDs:      stats.FilteredIDs,
-		FailedIDs:        stats.FailedIDs,
-		AcceptedIDs:      stats.AcceptedIDs,
-		NewIDs:           stats.NewIDs,
-		RefreshedIDs:     stats.RefreshedIDs,
-		SkippedCachedIDs: stats.SkippedCachedIDs,
-		Message:          fmt.Sprintf("同步完成，共保留 %d 条公告", len(out)),
-	}); err != nil {
+	if err := emitProgress(progress, stats.progress(req.RunID, "done", 0, len(detailIDs), len(detailIDs), nil, fmt.Sprintf("同步完成，共保留 %d 条公告", len(out)))); err != nil {
 		return out, err
 	}
 	return out, nil

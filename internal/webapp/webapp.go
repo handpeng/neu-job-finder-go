@@ -89,6 +89,7 @@ func (a *App) Handler() http.Handler {
 }
 
 type streamPayload struct {
+	RunID            string
 	Type             string
 	Message          string
 	Page             int
@@ -106,6 +107,9 @@ type streamPayload struct {
 	NewIDs           int
 	RefreshedIDs     int
 	SkippedCachedIDs int
+	DetailsAttempted int
+	DetailsSucceeded int
+	FailedDetails    []model.CrawlFailure
 	Company          string
 	Positions        []string
 	Inserted         int
@@ -128,6 +132,20 @@ func (a *App) handleSyncStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "streaming is not supported", http.StatusInternalServerError)
 		return
 	}
+	req := crawler.SyncRequest{
+		StartDate:           r.Form.Get("published_since"),
+		EndDate:             endDateFromValues(r.Form),
+		Keyword:             r.Form.Get("keyword"),
+		CachedAnnouncements: a.store.All(),
+		ForceRefresh:        formTruthy(r.Form, "force_refresh"),
+		RetryIDs:            splitIDs(firstNonEmpty(r.Form.Get("retry_ids"), r.Form.Get("retry"))),
+	}
+	run := crawler.NewCrawlRun(req)
+	req.RunID = run.RunID
+	if err := a.store.BeginRun(run); err != nil {
+		http.Error(w, "无法开始同步记录："+err.Error(), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-store")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -147,38 +165,13 @@ func (a *App) handleSyncStream(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	inserted := 0
 	updated := 0
+	collector := newAnnouncementBatchCollector(a.store, 20)
 	var summary crawler.ProgressEvent
-	_, syncErr := a.crawler.SyncProgress(ctx, crawler.SyncRequest{
-		StartDate:           r.Form.Get("published_since"),
-		EndDate:             endDateFromValues(r.Form),
-		Keyword:             r.Form.Get("keyword"),
-		CachedAnnouncements: a.store.All(),
-		ForceRefresh:        formTruthy(r.Form, "force_refresh"),
-	}, func(event crawler.ProgressEvent) error {
-		if event.Phase == "done" || event.Phase == "partial" {
-			summary = event
-		}
-		payload := streamPayload{
-			Type:             event.Phase,
-			Message:          event.Message,
-			Page:             event.Page,
-			Current:          event.Current,
-			Total:            event.Total,
-			PagesScanned:     event.PagesScanned,
-			EntriesSeen:      event.EntriesSeen,
-			UniqueIDs:        event.UniqueIDs,
-			InRangeIDs:       event.InRangeIDs,
-			DuplicateIDs:     event.DuplicateIDs,
-			UndatedIDs:       event.UndatedIDs,
-			FilteredIDs:      event.FilteredIDs,
-			FailedIDs:        event.FailedIDs,
-			AcceptedIDs:      event.AcceptedIDs,
-			NewIDs:           event.NewIDs,
-			RefreshedIDs:     event.RefreshedIDs,
-			SkippedCachedIDs: event.SkippedCachedIDs,
-		}
+	_, syncErr := a.crawler.SyncProgress(ctx, req, func(event crawler.ProgressEvent) error {
+		summary = event
+		payload := streamPayloadFromEvent(event)
 		if event.Announcement != nil {
-			ins, upd, err := a.store.Upsert([]model.Announcement{*event.Announcement})
+			ins, upd, err := collector.Add(*event.Announcement)
 			if err != nil {
 				return fmt.Errorf("save %s: %w", event.Announcement.ID, err)
 			}
@@ -193,46 +186,125 @@ func (a *App) handleSyncStream(w http.ResponseWriter, r *http.Request) {
 		}
 		return send(payload)
 	})
-	if syncErr != nil {
-		a.logger.Printf("stream sync: %v", syncErr)
-		_ = send(streamPayload{
-			Type:             "error",
-			Message:          "同步停止：" + syncErr.Error(),
-			Inserted:         inserted,
-			Updated:          updated,
-			PagesScanned:     summary.PagesScanned,
-			EntriesSeen:      summary.EntriesSeen,
-			UniqueIDs:        summary.UniqueIDs,
-			InRangeIDs:       summary.InRangeIDs,
-			DuplicateIDs:     summary.DuplicateIDs,
-			UndatedIDs:       summary.UndatedIDs,
-			FilteredIDs:      summary.FilteredIDs,
-			FailedIDs:        summary.FailedIDs,
-			AcceptedIDs:      summary.AcceptedIDs,
-			NewIDs:           summary.NewIDs,
-			RefreshedIDs:     summary.RefreshedIDs,
-			SkippedCachedIDs: summary.SkippedCachedIDs,
-		})
+	run = crawler.FinalizeCrawlRun(run, summary, syncErr, ctx.Err())
+	pending := collector.Pending()
+	finalInserted, finalUpdated, saveErr := a.store.UpsertBatchAndFinishRun(pending, run)
+	inserted += finalInserted
+	updated += finalUpdated
+	if saveErr != nil {
+		a.logger.Printf("stream persist: %v", saveErr)
+		_ = send(streamPayload{RunID: run.RunID, Type: "error", Message: "保存同步记录失败：" + saveErr.Error(), Inserted: inserted, Updated: updated})
 		return
 	}
-	_ = send(streamPayload{
-		Type:             "complete",
-		Message:          fmt.Sprintf("同步完成：新增 %d，更新 %d。", inserted, updated),
-		Inserted:         inserted,
-		Updated:          updated,
-		PagesScanned:     summary.PagesScanned,
-		EntriesSeen:      summary.EntriesSeen,
-		UniqueIDs:        summary.UniqueIDs,
-		InRangeIDs:       summary.InRangeIDs,
-		DuplicateIDs:     summary.DuplicateIDs,
-		UndatedIDs:       summary.UndatedIDs,
-		FilteredIDs:      summary.FilteredIDs,
-		FailedIDs:        summary.FailedIDs,
-		AcceptedIDs:      summary.AcceptedIDs,
-		NewIDs:           summary.NewIDs,
-		RefreshedIDs:     summary.RefreshedIDs,
-		SkippedCachedIDs: summary.SkippedCachedIDs,
+	if syncErr != nil {
+		a.logger.Printf("stream sync: %v", syncErr)
+		payload := streamPayloadFromEvent(summary)
+		payload.Type = "error"
+		payload.Message = "同步停止：" + syncErr.Error()
+		payload.Inserted = inserted
+		payload.Updated = updated
+		_ = send(payload)
+		return
+	}
+	payload := streamPayloadFromEvent(summary)
+	payload.Type = "complete"
+	payload.Message = fmt.Sprintf("同步完成：新增 %d，更新 %d。", inserted, updated)
+	payload.Inserted = inserted
+	payload.Updated = updated
+	_ = send(payload)
+}
+
+func streamPayloadFromEvent(event crawler.ProgressEvent) streamPayload {
+	return streamPayload{
+		RunID:            event.RunID,
+		Type:             event.Phase,
+		Message:          event.Message,
+		Page:             event.Page,
+		Current:          event.Current,
+		Total:            event.Total,
+		PagesScanned:     event.PagesScanned,
+		EntriesSeen:      event.EntriesSeen,
+		UniqueIDs:        event.UniqueIDs,
+		InRangeIDs:       event.InRangeIDs,
+		DuplicateIDs:     event.DuplicateIDs,
+		UndatedIDs:       event.UndatedIDs,
+		FilteredIDs:      event.FilteredIDs,
+		FailedIDs:        event.FailedIDs,
+		AcceptedIDs:      event.AcceptedIDs,
+		NewIDs:           event.NewIDs,
+		RefreshedIDs:     event.RefreshedIDs,
+		SkippedCachedIDs: event.SkippedCachedIDs,
+		DetailsAttempted: event.DetailsAttempted,
+		DetailsSucceeded: event.DetailsSucceeded,
+		FailedDetails:    append([]model.CrawlFailure(nil), event.FailedDetails...),
+	}
+}
+
+type announcementBatchCollector struct {
+	store *store.Store
+	limit int
+	items []model.Announcement
+}
+
+func newAnnouncementBatchCollector(st *store.Store, limit int) *announcementBatchCollector {
+	if limit <= 0 {
+		limit = 20
+	}
+	return &announcementBatchCollector{store: st, limit: limit}
+}
+
+func (c *announcementBatchCollector) Add(item model.Announcement) (inserted, updated int, err error) {
+	c.items = append(c.items, item)
+	if len(c.items) < c.limit {
+		return 0, 0, nil
+	}
+	return c.flush()
+}
+
+func (c *announcementBatchCollector) flush() (inserted, updated int, err error) {
+	if len(c.items) == 0 {
+		return 0, 0, nil
+	}
+	inserted, updated, err = c.store.UpsertBatch(c.items)
+	if err != nil {
+		return 0, 0, err
+	}
+	c.items = nil
+	return inserted, updated, nil
+}
+
+func (c *announcementBatchCollector) Pending() []model.Announcement {
+	items := append([]model.Announcement(nil), c.items...)
+	c.items = nil
+	return items
+}
+
+func splitIDs(value string) []string {
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == '，' || r == ';' || r == '；' || r == '|' || r == ' ' || r == '\t' || r == '\n'
 	})
+	seen := make(map[string]struct{}, len(parts))
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		if _, exists := seen[part]; exists {
+			continue
+		}
+		seen[part] = struct{}{}
+		out = append(out, part)
+	}
+	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (a *App) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -275,13 +347,26 @@ func (a *App) handleSync(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	endDate := endDateFromValues(r.Form)
 	forceRefresh := formTruthy(r.Form, "force_refresh")
-	items, err := a.crawler.Sync(ctx, crawler.SyncRequest{
+	req := crawler.SyncRequest{
 		StartDate:           r.Form.Get("published_since"),
 		EndDate:             endDate,
 		Keyword:             r.Form.Get("keyword"),
 		CachedAnnouncements: a.store.All(),
 		ForceRefresh:        forceRefresh,
+		RetryIDs:            splitIDs(firstNonEmpty(r.Form.Get("retry_ids"), r.Form.Get("retry"))),
+	}
+	run := crawler.NewCrawlRun(req)
+	req.RunID = run.RunID
+	if err := a.store.BeginRun(run); err != nil {
+		http.Error(w, "无法开始同步记录："+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var summary crawler.ProgressEvent
+	items, syncErr := a.crawler.SyncProgress(ctx, req, func(event crawler.ProgressEvent) error {
+		summary = event
+		return nil
 	})
+	run = crawler.FinalizeCrawlRun(run, summary, syncErr, ctx.Err())
 	q := url.Values{}
 	copyProfile(q, r.Form)
 	q.Set("published_since", r.Form.Get("published_since"))
@@ -290,24 +375,25 @@ func (a *App) handleSync(w http.ResponseWriter, r *http.Request) {
 	if forceRefresh {
 		q.Set("force_refresh", "1")
 	}
-	if err != nil && len(items) == 0 {
-		a.logger.Printf("sync: %v", err)
-		q.Set("error", "抓取失败："+err.Error())
+	ins, upd, saveErr := a.store.UpsertBatchAndFinishRun(items, run)
+	if saveErr != nil {
+		a.logger.Printf("sync persist: %v", saveErr)
+		q.Set("error", "保存失败："+saveErr.Error())
 		http.Redirect(w, r, "/?"+q.Encode(), http.StatusSeeOther)
 		return
 	}
-	syncErr := err
-	ins, upd, saveErr := a.store.Upsert(items)
-	if saveErr != nil {
-		q.Set("error", "保存失败："+saveErr.Error())
-	} else {
-		message := fmt.Sprintf("同步完成：抓取 %d 条公告，新增 %d，更新 %d。", len(items), ins, upd)
-		if syncErr != nil {
-			a.logger.Printf("sync warning: %v", syncErr)
-			message += " 部分详情失败，成功结果已保存；请查看服务日志。"
-		}
-		q.Set("message", message)
+	if syncErr != nil && len(items) == 0 {
+		a.logger.Printf("sync: %v", syncErr)
+		q.Set("error", "抓取失败："+syncErr.Error())
+		http.Redirect(w, r, "/?"+q.Encode(), http.StatusSeeOther)
+		return
 	}
+	message := fmt.Sprintf("同步完成：抓取 %d 条公告，新增 %d，更新 %d。", len(items), ins, upd)
+	if syncErr != nil {
+		a.logger.Printf("sync warning: %v", syncErr)
+		message += " 部分详情失败，成功结果已保存；请查看服务日志。"
+	}
+	q.Set("message", message)
 	http.Redirect(w, r, "/?"+q.Encode(), http.StatusSeeOther)
 }
 

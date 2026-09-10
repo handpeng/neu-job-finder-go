@@ -4,6 +4,7 @@ import (
 	"neu-job-finder/internal/model"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNoProfileMeansUnscored(t *testing.T) {
@@ -248,5 +249,76 @@ func TestLegacyProfileMapsToOptionalBooleanGroups(t *testing.T) {
 	v := Score(model.Announcement{}, model.Position{Name: "算法工程师"}, model.Profile{Roles: "算法工程师", Skills: "Python"})
 	if !v.Eligible || v.Score == nil || len(v.BooleanMatched) == 0 {
 		t.Fatalf("legacy profile compatibility failed: %#v", v)
+	}
+}
+
+func TestRankingUsesPublishedDateThenStableID(t *testing.T) {
+	oldSeen := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+	newSeen := oldSeen.Add(24 * time.Hour)
+	items := []model.Announcement{
+		{ID: "old", PublishedDate: "2026-09-01", LastSeenAt: newSeen, Positions: []model.Position{{ID: "old:1", Name: "算法工程师"}}},
+		{ID: "new", PublishedDate: "2026-09-02", LastSeenAt: oldSeen, Positions: []model.Position{{ID: "new:1", Name: "算法工程师"}}},
+		{ID: "same", PublishedDate: "2026-09-02", Positions: []model.Position{{ID: "same:1", Name: "算法工程师"}}},
+	}
+	jobs := Flatten(items, model.Profile{Roles: "算法工程师"})
+	if len(jobs) != 3 {
+		t.Fatalf("jobs=%d", len(jobs))
+	}
+	if jobs[0].Announcement.ID != "new" || jobs[1].Announcement.ID != "same" || jobs[2].Announcement.ID != "old" {
+		t.Fatalf("unexpected order: %s, %s, %s", jobs[0].Announcement.ID, jobs[1].Announcement.ID, jobs[2].Announcement.ID)
+	}
+}
+
+func TestMinScoreAndTopNOnlyLimitResults(t *testing.T) {
+	items := []model.Announcement{
+		{ID: "a", PublishedDate: "2026-09-01", Positions: []model.Position{{ID: "a:1", Name: "算法工程师"}}},
+		{ID: "b", PublishedDate: "2026-09-02", Positions: []model.Position{{ID: "b:1", Name: "算法工程师"}}},
+		{ID: "c", PublishedDate: "2026-09-03", Positions: []model.Position{{ID: "c:1", Name: "算法工程师"}}},
+	}
+	minimum := 90
+	jobs := FlattenWithOptions(items, model.Profile{Roles: "算法工程师"}, ResultOptions{MinScore: &minimum, TopN: 2})
+	if len(items) != 3 {
+		t.Fatalf("result controls changed source input length: %d", len(items))
+	}
+	if len(jobs) != 2 || jobs[0].Announcement.ID != "c" || jobs[1].Announcement.ID != "b" {
+		t.Fatalf("jobs=%#v", jobs)
+	}
+	low := 101
+	if jobs := FlattenWithOptions(items, model.Profile{Roles: "算法工程师"}, ResultOptions{MinScore: &low}); len(jobs) != 0 {
+		t.Fatalf("min_score should filter every result: %#v", jobs)
+	}
+}
+
+func TestBroadProfileDoesNotMechanicallyDiluteRelevantEvidence(t *testing.T) {
+	items := []model.Announcement{
+		{
+			ID: "relevant",
+			Positions: []model.Position{{
+				ID:     "relevant:1",
+				Name:   "钢铁冶金智能制造算法工程师",
+				Majors: "冶金工程",
+				Evidence: []model.EvidenceFragment{{
+					Text:       "Python 机器学习 工业人工智能 转炉 数据驱动",
+					Provenance: model.PositionLocal,
+				}},
+			}},
+		},
+		{ID: "unrelated", Positions: []model.Position{{ID: "unrelated:1", Name: "行政专员"}}},
+	}
+	p := model.Profile{
+		Roles:    "算法工程师、研发工程师、工艺工程师",
+		Skills:   "Python、Java、Go、Rust、SQL、Kubernetes、Docker",
+		Research: "冶金、转炉、机器学习、深度学习、数字孪生、数据驱动",
+		Major:    "冶金工程、材料工程、计算机科学",
+	}
+	jobs := Flatten(items, p)
+	if len(jobs) != 2 {
+		t.Fatalf("jobs=%d", len(jobs))
+	}
+	if jobs[0].Announcement.ID != "relevant" {
+		t.Fatalf("relevant job was not ranked first: %#v", jobs)
+	}
+	if jobs[0].Score == nil || jobs[1].Score == nil || *jobs[0].Score <= *jobs[1].Score {
+		t.Fatalf("scores do not separate controls: relevant=%v unrelated=%v", jobs[0].Score, jobs[1].Score)
 	}
 }

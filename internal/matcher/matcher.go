@@ -32,6 +32,7 @@ type fieldScore struct {
 	active   bool
 	hard     bool
 	ok       bool
+	semantic bool
 }
 
 type evidenceSource struct {
@@ -48,7 +49,17 @@ type BooleanResult struct {
 	Evidence   []model.MatchEvidence
 }
 
+type ResultOptions struct {
+	MinScore *int
+	TopN     int
+}
+
 func Flatten(items []model.Announcement, p model.Profile) []model.JobView {
+	return FlattenWithOptions(items, p, ResultOptions{})
+}
+
+func FlattenWithOptions(items []model.Announcement, p model.Profile, options ResultOptions) []model.JobView {
+	options = normalizeResultOptions(options)
 	out := []model.JobView{}
 	for _, a := range items {
 		for _, pos := range a.Positions {
@@ -57,6 +68,9 @@ func Flatten(items []model.Announcement, p model.Profile) []model.JobView {
 				continue
 			}
 			if p.Strict && len(v.HardMismatch) > 0 {
+				continue
+			}
+			if options.MinScore != nil && (v.Score == nil || *v.Score < *options.MinScore) {
 				continue
 			}
 			out = append(out, v)
@@ -72,9 +86,39 @@ func Flatten(items []model.Announcement, p model.Profile) []model.JobView {
 		if out[i].Score != nil && out[j].Score != nil && *out[i].Score != *out[j].Score {
 			return *out[i].Score > *out[j].Score
 		}
-		return out[i].Announcement.LastSeenAt.After(out[j].Announcement.LastSeenAt)
+		if out[i].Announcement.PublishedDate != out[j].Announcement.PublishedDate {
+			return out[i].Announcement.PublishedDate > out[j].Announcement.PublishedDate
+		}
+		return stableID(out[i]) < stableID(out[j])
 	})
+	if options.TopN > 0 && len(out) > options.TopN {
+		out = out[:options.TopN]
+	}
 	return out
+}
+
+func normalizeResultOptions(options ResultOptions) ResultOptions {
+	if options.MinScore != nil {
+		value := *options.MinScore
+		if value < 0 {
+			value = 0
+		}
+		options.MinScore = &value
+	}
+	if options.TopN < 0 {
+		options.TopN = 0
+	}
+	return options
+}
+
+func stableID(v model.JobView) string {
+	if v.Position.ID != "" {
+		return v.Position.ID
+	}
+	if v.Announcement.ID != "" {
+		return v.Announcement.ID
+	}
+	return v.Announcement.DetailURL + "\x00" + v.Position.Name
 }
 
 func Score(a model.Announcement, pos model.Position, p model.Profile) model.JobView {
@@ -118,8 +162,12 @@ func Score(a model.Announcement, pos model.Position, p model.Profile) model.JobV
 			continue
 		}
 		active++
-		weightSum += f.weight
-		weighted += f.weight * f.score
+		weight := f.weight
+		if f.semantic && !f.ok {
+			weight *= 0.2
+		}
+		weightSum += weight
+		weighted += weight * f.score
 		if f.ok && f.reason != "" {
 			v.Matched = append(v.Matched, f.reason)
 			v.MatchEvidence = append(v.MatchEvidence, f.evidence...)
@@ -293,12 +341,12 @@ func semanticField(name, query string, sources []evidenceSource, weight float64)
 	if len(q) == 0 {
 		return fieldScore{name: name}
 	}
-	score := 0.0
-	hits := []model.MatchEvidence{}
+	evidenceScore := 0.0
+	allHits := []model.MatchEvidence{}
 	for _, term := range q {
 		if hit, ok := bestEvidence(sources, term); ok {
-			score += hit.confidence
-			hits = append(hits, model.MatchEvidence{
+			evidenceScore += hit.confidence
+			allHits = append(allHits, model.MatchEvidence{
 				Field:      name,
 				Term:       term,
 				Provenance: hit.provenance,
@@ -306,7 +354,8 @@ func semanticField(name, query string, sources []evidenceSource, weight float64)
 			})
 		}
 	}
-	score /= float64(len(q))
+	score := semanticEvidenceScore(evidenceScore, allHits)
+	hits := allHits
 	if len(hits) > 4 {
 		hits = hits[:4]
 	}
@@ -318,7 +367,33 @@ func semanticField(name, query string, sources []evidenceSource, weight float64)
 		evidence: hits,
 		active:   true,
 		ok:       score > 0,
+		semantic: true,
 	}
+}
+
+func semanticEvidenceScore(sum float64, hits []model.MatchEvidence) float64 {
+	if len(hits) == 0 || sum <= 0 {
+		return 0
+	}
+	score := 0.5 + 0.5*minFloat(sum, 1)
+	fallbackOnly := true
+	for _, hit := range hits {
+		if hit.Provenance != model.AnnouncementGlobalFallback {
+			fallbackOnly = false
+			break
+		}
+	}
+	if fallbackOnly && score > 0.7 {
+		return 0.7
+	}
+	return score
+}
+
+func minFloat(left, right float64) float64 {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 func bestEvidence(sources []evidenceSource, term string) (evidenceSource, bool) {

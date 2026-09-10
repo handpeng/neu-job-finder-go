@@ -99,6 +99,12 @@ job.neu.edu.cn public pages
 
 为了兼容第一版，旧的 `roles`、`skills`、`research`、`major` 字段会分别映射为可选 `should` group，`minimum_should_match=0`，因此不会把旧 Profile 变成强制过滤条件。学历、城市和毕业年份仍由独立 hard-condition 逻辑处理。
 
+### 结果控制与排名
+
+布尔 eligibility 通过后才进入评分。语义字段按命中证据饱和计分，未命中的可选语义字段只保留很小的排名影响，避免填写更多技能后把明确相关岗位机械稀释。`min_score` 在评分后过滤，`top_n` 在排序后截取；两者都不会删除或减少本地原始公告。
+
+排名顺序固定为：`score DESC`、源站 `PublishedDate DESC`、岗位稳定 ID 升序。`LastSeenAt` 只表示本地抓取时间，不参与岗位新鲜度排名。
+
 ## 已知边界
 
 - 网站压缩方式或 HTML 若改版，`internal/crawler` 的解码与解析器需要更新。

@@ -6,6 +6,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>NEU Job Finder</title>
   <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/status.css">
 </head>
 <body>
 <header class="topbar">
@@ -30,7 +31,17 @@
       <label>专业<input name="major" value="{{.Profile.Major}}" placeholder="例：冶金工程"></label>
       <label>意向城市<input name="cities" value="{{.Profile.Cities}}" placeholder="例：上海、沈阳、北京"></label>
       <label>意向岗位<input name="roles" value="{{.Profile.Roles}}" placeholder="例：算法工程师、工艺工程师、研发工程师"></label>
+      <label>MUST 必须匹配<textarea name="must" placeholder="每行一组；组内 OR">{{groupsText .Profile.Query.Must}}</textarea></label>
+      <label>SHOULD 可选匹配<textarea name="should" placeholder="每行一组；组内 OR">{{groupsText .Profile.Query.Should}}</textarea></label>
+      <label>MUST_NOT 排除<textarea name="must_not" placeholder="每行一组；组内 OR">{{groupsText .Profile.Query.MustNot}}</textarea></label>
+      <div class="two-col">
+        <label>SHOULD 最少命中组<input type="number" name="minimum_should_match" min="0" value="{{.Profile.Query.MinimumShouldMatch}}"></label>
+        <label>最低匹配分<input type="number" name="min_score" min="0" max="100" value="{{.MinScore}}" placeholder="不限"></label>
+      </div>
+      <label>最多显示岗位<input type="number" name="top_n" min="0" value="{{.TopN}}" placeholder="不限"></label>
       <label class="check"><input type="checkbox" name="strict" value="1" {{if .Profile.Strict}}checked{{end}}> 严格过滤硬条件不匹配岗位</label>
+      <label class="check"><input type="checkbox" name="exclude_expired" value="1" {{if .ExcludeExpired}}checked{{end}}> 排除已过期岗位</label>
+      <input type="hidden" name="published_since" value="{{.StartDate}}"><input type="hidden" name="published_until" value="{{.EndDate}}"><input type="hidden" name="q" value="{{.Search}}">
       <button class="primary" type="submit">重新评分</button>
     </form>
 
@@ -38,8 +49,8 @@
       <div class="section-title"><span>02</span> 增量抓取</div>
       <div class="two-col"><label>发布日期起<input type="date" name="published_since" value="{{.StartDate}}"></label><label>发布日期止<input type="date" name="published_until" value="{{.EndDate}}"></label></div>
       <label>抓取关键词<input name="keyword" value="{{.Keyword}}" placeholder="可留空"></label>
-      <label class="check"><input type="checkbox" name="force_refresh" value="1" {{if .ForceRefresh}}checked{{end}}> 强制刷新已缓存详情</label>
-      <input type="hidden" name="research" value="{{.Profile.Research}}"><input type="hidden" name="skills" value="{{.Profile.Skills}}"><input type="hidden" name="degree" value="{{.Profile.Degree}}"><input type="hidden" name="graduation_year" value="{{.Profile.GraduationYear}}"><input type="hidden" name="major" value="{{.Profile.Major}}"><input type="hidden" name="cities" value="{{.Profile.Cities}}"><input type="hidden" name="roles" value="{{.Profile.Roles}}">{{if .Profile.Strict}}<input type="hidden" name="strict" value="1">{{end}}
+      <label>详情刷新模式<select name="refresh_mode"><option value="incremental" {{if eq .RefreshMode "incremental"}}selected{{end}}>增量：跳过稳定缓存</option><option value="force" {{if eq .RefreshMode "force"}}selected{{end}}>强制：刷新当前范围缓存</option></select></label>
+      <input type="hidden" name="research" value="{{.Profile.Research}}"><input type="hidden" name="skills" value="{{.Profile.Skills}}"><input type="hidden" name="degree" value="{{.Profile.Degree}}"><input type="hidden" name="graduation_year" value="{{.Profile.GraduationYear}}"><input type="hidden" name="major" value="{{.Profile.Major}}"><input type="hidden" name="cities" value="{{.Profile.Cities}}"><input type="hidden" name="roles" value="{{.Profile.Roles}}"><input type="hidden" name="must" value="{{groupsText .Profile.Query.Must}}"><input type="hidden" name="should" value="{{groupsText .Profile.Query.Should}}"><input type="hidden" name="must_not" value="{{groupsText .Profile.Query.MustNot}}"><input type="hidden" name="minimum_should_match" value="{{.Profile.Query.MinimumShouldMatch}}"><input type="hidden" name="min_score" value="{{.MinScore}}"><input type="hidden" name="top_n" value="{{.TopN}}"><input type="hidden" name="q" value="{{.Search}}">{{if .Profile.Strict}}<input type="hidden" name="strict" value="1">{{end}}{{if .ExcludeExpired}}<input type="hidden" name="exclude_expired" value="1">{{end}}
       <button class="sync" type="submit">开始低频同步</button>
       <p class="hint">抓取包含起止日期；默认为最近 30 天至今天。详情页之间至少等待约 1.2 秒。</p>
       <div class="sync-progress" id="syncProgress" hidden aria-live="polite">
@@ -58,17 +69,24 @@
       <div class="stat"><strong id="positionCount">{{.PositionN}}</strong><span>已提取岗位</span></div>
       <div class="stat"><strong>{{.ScoredN}}</strong><span>已评分岗位</span></div>
     </div>
+    {{if .LatestRun}}
+    <div class="run-status card">
+      <div><small>最近同步</small><strong>{{runStatusText .LatestRun.Status}}</strong><span>{{.LatestRun.RunID}}</span></div>
+      <div><small>发现 / 成功 / 失败</small><strong>{{.LatestRun.UniqueIDs}} / {{.LatestRun.DetailsSucceeded}} / {{.LatestRun.FailedIDs}}</strong><span>{{.LatestRun.RequestedStartDate}} 至 {{.LatestRun.RequestedEndDate}}</span></div>
+      <a href="/api/runs/{{.LatestRun.RunID}}" target="_blank" rel="noreferrer">查看 run JSON ↗</a>
+    </div>
+    {{end}}
 
     <div class="toolbar card">
       <form method="get" action="/" class="searchbar">
-        <input name="q" placeholder="在已抓取岗位中搜索公司 / 岗位 / 城市 / 专业">
-        <input type="hidden" name="research" value="{{.Profile.Research}}"><input type="hidden" name="skills" value="{{.Profile.Skills}}"><input type="hidden" name="degree" value="{{.Profile.Degree}}"><input type="hidden" name="graduation_year" value="{{.Profile.GraduationYear}}"><input type="hidden" name="major" value="{{.Profile.Major}}"><input type="hidden" name="cities" value="{{.Profile.Cities}}"><input type="hidden" name="roles" value="{{.Profile.Roles}}">{{if .Profile.Strict}}<input type="hidden" name="strict" value="1">{{end}}
+        <input name="q" value="{{.Search}}" placeholder="在已抓取岗位中搜索公司 / 岗位 / 城市 / 专业">
+        <input type="hidden" name="research" value="{{.Profile.Research}}"><input type="hidden" name="skills" value="{{.Profile.Skills}}"><input type="hidden" name="degree" value="{{.Profile.Degree}}"><input type="hidden" name="graduation_year" value="{{.Profile.GraduationYear}}"><input type="hidden" name="major" value="{{.Profile.Major}}"><input type="hidden" name="cities" value="{{.Profile.Cities}}"><input type="hidden" name="roles" value="{{.Profile.Roles}}"><input type="hidden" name="must" value="{{groupsText .Profile.Query.Must}}"><input type="hidden" name="should" value="{{groupsText .Profile.Query.Should}}"><input type="hidden" name="must_not" value="{{groupsText .Profile.Query.MustNot}}"><input type="hidden" name="minimum_should_match" value="{{.Profile.Query.MinimumShouldMatch}}"><input type="hidden" name="min_score" value="{{.MinScore}}"><input type="hidden" name="top_n" value="{{.TopN}}"><input type="hidden" name="published_since" value="{{.StartDate}}"><input type="hidden" name="published_until" value="{{.EndDate}}">{{if .Profile.Strict}}<input type="hidden" name="strict" value="1">{{end}}{{if .ExcludeExpired}}<input type="hidden" name="exclude_expired" value="1">{{end}}
         <button type="submit">搜索</button>
       </form>
       <div class="exports">
-        <a href="/export.xlsx?research={{urlquery .Profile.Research}}&skills={{urlquery .Profile.Skills}}&degree={{urlquery .Profile.Degree}}&graduation_year={{urlquery .Profile.GraduationYear}}&major={{urlquery .Profile.Major}}&cities={{urlquery .Profile.Cities}}&roles={{urlquery .Profile.Roles}}&strict={{if .Profile.Strict}}1{{end}}">Excel</a>
-        <a href="/export.md?research={{urlquery .Profile.Research}}&skills={{urlquery .Profile.Skills}}&degree={{urlquery .Profile.Degree}}&graduation_year={{urlquery .Profile.GraduationYear}}&major={{urlquery .Profile.Major}}&cities={{urlquery .Profile.Cities}}&roles={{urlquery .Profile.Roles}}&strict={{if .Profile.Strict}}1{{end}}">Markdown</a>
-        <a href="/export.csv?research={{urlquery .Profile.Research}}&skills={{urlquery .Profile.Skills}}&degree={{urlquery .Profile.Degree}}&graduation_year={{urlquery .Profile.GraduationYear}}&major={{urlquery .Profile.Major}}&cities={{urlquery .Profile.Cities}}&roles={{urlquery .Profile.Roles}}&strict={{if .Profile.Strict}}1{{end}}">CSV</a>
+        <a href="/export.xlsx?{{.ExportQuery}}">Excel</a>
+        <a href="/export.md?{{.ExportQuery}}">Markdown</a>
+        <a href="/export.csv?{{.ExportQuery}}">CSV</a>
       </div>
     </div>
 
@@ -78,8 +96,10 @@
         <div class="score {{scoreClass .Score}}"><b>{{scoreText .Score}}</b><span>{{if .Score}}匹配分{{else}}条件为空{{end}}</span></div>
         <div class="job-main">
           <div class="job-heading"><div><h2>{{.Position.Name}}</h2><p>{{.Announcement.Company}}</p></div><a href="{{.Announcement.DetailURL}}" target="_blank" rel="noreferrer">原文 ↗</a></div>
-          <div class="chips"><span>{{if .Position.Location}}{{.Position.Location}}{{else}}地点未注明{{end}}</span><span>{{if .Position.Degree}}{{.Position.Degree}}{{else}}学历未注明{{end}}</span><span>{{if .Position.Salary}}{{.Position.Salary}}{{else}}薪资面议/未注明{{end}}</span>{{if .Announcement.PublishedDate}}<span>发布 {{.Announcement.PublishedDate}}</span>{{end}}{{if .Announcement.ExpireDate}}<span>截止 {{.Announcement.ExpireDate}}</span>{{end}}</div>
+          <div class="chips"><span class="status {{.Status}}">{{if eq .Status "expired"}}已过期{{else}}有效{{end}}</span><span>{{if .Position.Location}}{{.Position.Location}}{{else}}地点未注明{{end}}</span><span>{{if .Position.Degree}}{{.Position.Degree}}{{else}}学历未注明{{end}}</span><span>{{if .Position.Salary}}{{.Position.Salary}}{{else}}薪资面议/未注明{{end}}</span>{{if .Announcement.PublishedDate}}<span>发布 {{.Announcement.PublishedDate}}</span>{{end}}{{if .Announcement.ExpireDate}}<span>截止 {{.Announcement.ExpireDate}}</span>{{end}}</div>
           {{if .Position.Majors}}<p class="majors"><b>需求专业</b> {{.Position.Majors}}</p>{{end}}
+          {{if .BooleanMatched}}<p class="evidence good"><b>Boolean</b> {{join .BooleanMatched " · "}}</p>{{end}}
+          {{if .Exclusions}}<p class="evidence bad"><b>排除</b> {{join .Exclusions " · "}}</p>{{end}}
           {{if .Matched}}<p class="evidence good"><b>匹配证据</b> {{join .Matched " · "}}</p>{{end}}
           {{if .HardMismatch}}<p class="evidence bad"><b>硬条件</b> {{join .HardMismatch " · "}}</p>{{end}}
           {{if .Missing}}<p class="evidence"><b>待核实</b> {{join .Missing " · "}}</p>{{end}}

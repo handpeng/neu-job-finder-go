@@ -14,19 +14,23 @@ import (
 
 func CSV(w io.Writer, jobs []model.JobView) error {
 	cw := csv.NewWriter(w)
-	defer cw.Flush()
-	_ = cw.Write(headers())
-	for _, j := range jobs {
-		_ = cw.Write(row(j))
+	if err := cw.Write(headers()); err != nil {
+		return err
 	}
+	for _, j := range jobs {
+		if err := cw.Write(row(j)); err != nil {
+			return err
+		}
+	}
+	cw.Flush()
 	return cw.Error()
 }
 
 func Markdown(w io.Writer, jobs []model.JobView) error {
 	fmt.Fprintln(w, "# 东北大学就业网岗位匹配报告")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "|匹配分|单位|岗位|地点|学历|薪资|专业|截止时间|投递邮箱|网申链接|投递要求|详情|")
-	fmt.Fprintln(w, "|---:|---|---|---|---|---|---|---|---|---|---|---|")
+	fmt.Fprintln(w, "|匹配分|状态|单位|岗位|地点|学历|薪资|专业|截止时间|投递邮箱|网申链接|投递要求|详情|")
+	fmt.Fprintln(w, "|---:|---|---|---|---|---|---|---|---|---|---|---|---|")
 	for _, j := range jobs {
 		score := "未评分"
 		if j.Score != nil {
@@ -36,8 +40,8 @@ func Markdown(w io.Writer, jobs []model.JobView) error {
 		if j.Announcement.ApplicationURL != "" {
 			applicationURL = "[网申](" + j.Announcement.ApplicationURL + ")"
 		}
-		fmt.Fprintf(w, "|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|[原文](%s)|\n",
-			escapeMD(score), escapeMD(j.Announcement.Company), escapeMD(j.Position.Name),
+		fmt.Fprintf(w, "|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|[原文](%s)|\n",
+			escapeMD(score), escapeMD(j.Status), escapeMD(j.Announcement.Company), escapeMD(j.Position.Name),
 			escapeMD(j.Position.Location), escapeMD(j.Position.Degree), escapeMD(j.Position.Salary),
 			escapeMD(j.Position.Majors), escapeMD(j.Announcement.ExpireDate), escapeMD(j.Announcement.Email),
 			applicationURL, escapeMD(j.Announcement.ApplicationRequirements), j.Announcement.DetailURL)
@@ -80,7 +84,7 @@ func writeSheet(w io.Writer, jobs []model.JobView) error {
 	for i, j := range jobs {
 		writeXMLRow(&b, i+2, row(j), 0)
 	}
-	b.WriteString(`</sheetData><autoFilter ref="A1:M1"/></worksheet>`)
+	b.WriteString(`</sheetData><autoFilter ref="A1:N1"/></worksheet>`)
 	_, err := w.Write(b.Bytes())
 	return err
 }
@@ -107,7 +111,7 @@ func cellRef(col, row int) string {
 }
 
 func headers() []string {
-	return []string{"匹配分", "单位", "岗位", "地点", "学历", "薪资", "需求专业", "截止时间", "投递邮箱", "网申链接", "邮件标题要求", "投递要求", "详情页"}
+	return []string{"匹配分", "状态", "单位", "岗位", "地点", "学历", "薪资", "需求专业", "截止时间", "投递邮箱", "网申链接", "邮件标题要求", "投递要求", "详情页"}
 }
 
 func row(j model.JobView) []string {
@@ -115,7 +119,7 @@ func row(j model.JobView) []string {
 	if j.Score != nil {
 		score = fmt.Sprintf("%d", *j.Score)
 	}
-	return []string{score, j.Announcement.Company, j.Position.Name, j.Position.Location, j.Position.Degree, j.Position.Salary, j.Position.Majors, j.Announcement.ExpireDate, j.Announcement.Email, j.Announcement.ApplicationURL, j.Announcement.EmailSubject, j.Announcement.ApplicationRequirements, j.Announcement.DetailURL}
+	return []string{score, j.Status, j.Announcement.Company, j.Position.Name, j.Position.Location, j.Position.Degree, j.Position.Salary, j.Position.Majors, j.Announcement.ExpireDate, j.Announcement.Email, j.Announcement.ApplicationURL, j.Announcement.EmailSubject, j.Announcement.ApplicationRequirements, j.Announcement.DetailURL}
 }
 
 func escapeMD(s string) string {

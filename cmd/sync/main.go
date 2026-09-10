@@ -19,12 +19,17 @@ func main() {
 	end := flag.String("end", "", "publication end date YYYY-MM-DD; default today")
 	keyword := flag.String("keyword", "", "optional source keyword")
 	forceRefresh := flag.Bool("force-refresh", false, "refetch cached announcement details")
+	refreshMode := flag.String("refresh-mode", "incremental", "detail refresh mode: incremental or force")
 	delay := flag.Duration("delay", 1200*time.Millisecond, "delay between source requests")
 	maxPages := flag.Int("max-pages", 100, "maximum list pages")
 	detailWorkers := flag.Int("detail-workers", 3, "maximum concurrent detail workers")
 	maxConnections := flag.Int("max-connections", 0, "maximum HTTP connections per source host; default detail-workers")
 	retryIDs := flag.String("retry-ids", "", "comma- or space-separated announcement IDs to retry")
 	flag.Parse()
+	mode := strings.ToLower(strings.TrimSpace(*refreshMode))
+	if mode != "incremental" && mode != "force" {
+		fatal(fmt.Errorf("-refresh-mode must be incremental or force"))
+	}
 
 	now := time.Now()
 	if *start == "" {
@@ -45,7 +50,7 @@ func main() {
 		EndDate:             *end,
 		Keyword:             *keyword,
 		CachedAnnouncements: st.All(),
-		ForceRefresh:        *forceRefresh,
+		ForceRefresh:        *forceRefresh || mode == "force",
 		RetryIDs:            splitIDs(*retryIDs),
 	}
 	run := crawler.NewCrawlRun(req)

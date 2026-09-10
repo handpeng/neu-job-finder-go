@@ -30,21 +30,24 @@ const defaultRefreshWindow = 7 * 24 * time.Hour
 const defaultDetailWorkers = 3
 
 var (
-	reDetailID = regexp.MustCompile(`(?i)/campus/view/id/(\d+)`)
-	reTag      = regexp.MustCompile(`(?is)<[^>]+>`)
-	reScript   = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>`)
-	reTR       = regexp.MustCompile(`(?is)<tr[^>]*>(.*?)</tr>`)
-	reTD       = regexp.MustCompile(`(?is)<td[^>]*>(.*?)</td>`)
-	reLI       = regexp.MustCompile(`(?is)<li[^>]*>(.*?)</li>`)
-	reH5       = regexp.MustCompile(`(?is)<h5[^>]*>(.*?)</h5>`)
-	reTitle    = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
-	reExpire   = regexp.MustCompile(`过期时间\s*[：:]\s*(\d{4}-\d{2}-\d{2})`)
-	reDate     = regexp.MustCompile(`\b(20\d{2}-\d{2}-\d{2})\b`)
-	reEmail    = regexp.MustCompile(`(?i)[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}`)
-	reHref     = regexp.MustCompile(`(?is)<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>`)
-	reInfoList = regexp.MustCompile(`(?is)<ul[^>]*class=["'][^"']*\binfoList\b[^"']*["'][^>]*>(.*?)</ul>`)
-	reEmbedded = regexp.MustCompile(`(?is)Base64\.decode\s*\(\s*unzip\s*\(\s*["']([A-Za-z0-9+/=]+)["']\s*\)\s*\.substr\s*\(\s*(\d+)\s*\)\s*\)\s*\.substr\s*\(\s*(\d+)\s*\)`)
-	rePlainURL = regexp.MustCompile(`(?i)https?://[^\s"'<>]+`)
+	reDetailID          = regexp.MustCompile(`(?i)/campus/view/id/(\d+)`)
+	reTag               = regexp.MustCompile(`(?is)<[^>]+>`)
+	reScript            = regexp.MustCompile(`(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>`)
+	reTR                = regexp.MustCompile(`(?is)<tr[^>]*>(.*?)</tr>`)
+	reTD                = regexp.MustCompile(`(?is)<td[^>]*>(.*?)</td>`)
+	reLI                = regexp.MustCompile(`(?is)<li[^>]*>(.*?)</li>`)
+	reH5                = regexp.MustCompile(`(?is)<h5[^>]*>(.*?)</h5>`)
+	reTitle             = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+	reExpire            = regexp.MustCompile(`过期时间\s*[：:]\s*(\d{4}-\d{2}-\d{2})`)
+	reDate              = regexp.MustCompile(`\b(20\d{2}-\d{2}-\d{2})\b`)
+	reEmail             = regexp.MustCompile(`(?i)[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}`)
+	reHref              = regexp.MustCompile(`(?is)<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>`)
+	reInfoList          = regexp.MustCompile(`(?is)<ul[^>]*class=["'][^"']*\binfoList\b[^"']*["'][^>]*>(.*?)</ul>`)
+	reEmbedded          = regexp.MustCompile(`(?is)Base64\.decode\s*\(\s*unzip\s*\(\s*["']([A-Za-z0-9+/=]+)["']\s*\)\s*\.substr\s*\(\s*(\d+)\s*\)\s*\)\s*\.substr\s*\(\s*(\d+)\s*\)`)
+	rePlainURL          = regexp.MustCompile(`(?i)https?://[^\s"'<>]+`)
+	reMetadataLabel     = regexp.MustCompile(`(?i)^\s*(薪资|薪酬|工资|待遇|salary|工作地点|工作地|地点|城市|所在地|location|用工形式|就业形式|职位性质|工作性质|类型|employment|学历|学历要求|最低学历|degree)\s*[：:]\s*(.*?)\s*$`)
+	rePositionNameLabel = regexp.MustCompile(`(?i)^\s*(职位名称|岗位名称|职位|岗位|position|role)\s*[：:]\s*(.*?)\s*$`)
+	reSalaryValue       = regexp.MustCompile(`(?i)\d+\s*[-~至]\s*\d+`)
 )
 
 type Config struct {
@@ -852,7 +855,7 @@ func parseDetail(id, detailURL, body string) model.Announcement {
 	a.ApplicationRequirements = extractApplicationRequirements(text)
 	a.Positions = extractPositions(id, body)
 	if len(a.Positions) == 0 {
-		a.Positions = []model.Position{{ID: id + ":1", AnnouncementID: id, Name: "招聘公告（岗位见正文）"}}
+		a.Positions = []model.Position{fallbackPosition(id, body)}
 	}
 	return a
 }
@@ -875,6 +878,9 @@ func extractPositions(announcementID, body string) []model.Position {
 	out := []model.Position{}
 	seq := 0
 	for _, row := range rows {
+		if len(row) < 2 {
+			continue
+		}
 		cellsRaw := reTD.FindAllStringSubmatch(row[1], -1)
 		if len(cellsRaw) < 2 {
 			continue
@@ -883,15 +889,11 @@ func extractPositions(announcementID, body string) []model.Position {
 		for _, c := range cellsRaw {
 			cells = append(cells, strings.TrimSpace(cleanHTML(c[1])))
 		}
-		joined := strings.Join(cells, " | ")
-		if strings.Contains(joined, "职位信息") && strings.Contains(joined, "需求专业") {
+		if isPositionHeader(cells) {
 			continue
 		}
 
-		infoIdx := 0
-		if len(cells) >= 3 && isSequence(cells[0]) {
-			infoIdx = 1
-		}
+		infoIdx := positionInfoIndex(cellsRaw, cells)
 		if infoIdx >= len(cells) {
 			continue
 		}
@@ -903,34 +905,319 @@ func extractPositions(announcementID, body string) []model.Position {
 		if len(infoLines) == 0 || strings.Contains(infoLines[0], "招聘公告详情") {
 			continue
 		}
+		name := normalizePositionName(infoLines[0])
+		if name == "" || strings.Contains(name, "操作") {
+			continue
+		}
 		seq++
 		p := model.Position{
-			ID:             fmt.Sprintf("%s:%d", announcementID, seq),
-			AnnouncementID: announcementID,
-			Name:           infoLines[0],
-		}
-		if len(infoLines) > 1 {
-			p.Salary = infoLines[1]
-		}
-		if len(infoLines) > 2 {
-			p.Location = infoLines[2]
-		}
-		if len(infoLines) > 3 {
-			p.EmploymentType = infoLines[3]
-		}
-		if len(infoLines) > 4 {
-			p.Degree = infoLines[4]
+			ID:                fmt.Sprintf("%s:%d", announcementID, seq),
+			AnnouncementID:    announcementID,
+			Name:              name,
+			SourceText:        truncate(strings.TrimSpace(cleanHTML(row[1])), 4000),
+			ExtractionQuality: model.ExtractionConfident,
+			FieldQuality: map[string]model.ExtractionQuality{
+				model.PositionFieldName:           model.ExtractionConfident,
+				model.PositionFieldSalary:         model.ExtractionAmbiguous,
+				model.PositionFieldLocation:       model.ExtractionAmbiguous,
+				model.PositionFieldEmploymentType: model.ExtractionAmbiguous,
+				model.PositionFieldDegree:         model.ExtractionAmbiguous,
+				model.PositionFieldMajors:         model.ExtractionAmbiguous,
+			},
 		}
 
-		majorIdx := infoIdx + 1
-		if majorIdx < len(cells) {
-			p.Majors = cells[majorIdx]
+		assignments, qualities, extractionQuality, notes := parsePositionMetadata(infoLines[1:])
+		p.ExtractionQuality = mergeExtractionQuality(p.ExtractionQuality, extractionQuality)
+		for field, quality := range qualities {
+			p.FieldQuality[field] = quality
 		}
-		if p.Name != "" && !strings.Contains(p.Name, "操作") {
-			out = append(out, p)
+		p.Salary = assignments[model.PositionFieldSalary]
+		p.Location = assignments[model.PositionFieldLocation]
+		p.EmploymentType = assignments[model.PositionFieldEmploymentType]
+		p.Degree = assignments[model.PositionFieldDegree]
+
+		major, majorQuality, majorAmbiguous, majorNote := extractMajorCell(cells[infoIdx+1:])
+		if major != "" {
+			p.Majors = major
+			p.FieldQuality[model.PositionFieldMajors] = majorQuality
 		}
+		if majorAmbiguous {
+			p.FieldQuality[model.PositionFieldMajors] = model.ExtractionAmbiguous
+			p.ExtractionQuality = mergeExtractionQuality(p.ExtractionQuality, model.ExtractionAmbiguous)
+		}
+		if majorNote != "" {
+			notes = append(notes, majorNote)
+		}
+		p.ExtractionNote = strings.Join(uniqueNotes(notes), "; ")
+		if p.ExtractionNote != "" && p.ExtractionQuality == model.ExtractionConfident {
+			p.ExtractionQuality = model.ExtractionFallback
+		}
+		out = append(out, p)
 	}
 	return out
+}
+
+func fallbackPosition(announcementID, body string) model.Position {
+	return model.Position{
+		ID:                announcementID + ":1",
+		AnnouncementID:    announcementID,
+		Name:              "招聘公告（岗位见正文）",
+		SourceText:        truncate(strings.TrimSpace(cleanHTML(body)), 4000),
+		ExtractionQuality: model.ExtractionFallback,
+		ExtractionNote:    "未发现可安全解析的岗位表格，保留公告级岗位占位",
+		FieldQuality: map[string]model.ExtractionQuality{
+			model.PositionFieldName:           model.ExtractionFallback,
+			model.PositionFieldSalary:         model.ExtractionAmbiguous,
+			model.PositionFieldLocation:       model.ExtractionAmbiguous,
+			model.PositionFieldEmploymentType: model.ExtractionAmbiguous,
+			model.PositionFieldDegree:         model.ExtractionAmbiguous,
+			model.PositionFieldMajors:         model.ExtractionAmbiguous,
+		},
+	}
+}
+
+func positionInfoIndex(cellsRaw [][]string, cells []string) int {
+	infoIdx := 0
+	if len(cells) >= 3 && isSequence(cells[0]) {
+		infoIdx = 1
+	}
+	for i := infoIdx; i < len(cellsRaw); i++ {
+		fragment := strings.ToLower(cellsRaw[i][1])
+		if strings.Contains(fragment, "<li") || strings.Contains(fragment, "岗位名称") || strings.Contains(fragment, "职位名称") {
+			return i
+		}
+	}
+	return infoIdx
+}
+
+func isPositionHeader(cells []string) bool {
+	joined := strings.Join(cells, " | ")
+	return (strings.Contains(joined, "职位信息") && strings.Contains(joined, "需求专业")) ||
+		(strings.Contains(joined, "序号") && strings.Contains(joined, "职位"))
+}
+
+func normalizePositionName(value string) string {
+	value = strings.TrimSpace(value)
+	if match := rePositionNameLabel.FindStringSubmatch(value); len(match) > 2 {
+		value = strings.TrimSpace(match[2])
+	}
+	return value
+}
+
+func parsePositionMetadata(values []string) (map[string]string, map[string]model.ExtractionQuality, model.ExtractionQuality, []string) {
+	assignments := make(map[string]string)
+	qualities := make(map[string]model.ExtractionQuality)
+	fields := []string{model.PositionFieldSalary, model.PositionFieldLocation, model.PositionFieldEmploymentType, model.PositionFieldDegree}
+	for _, field := range fields {
+		qualities[field] = model.ExtractionAmbiguous
+	}
+	notes := []string{}
+	if len(values) == 0 {
+		return assignments, qualities, model.ExtractionFallback, []string{"岗位元数据缺失"}
+	}
+
+	unknown := false
+	duplicate := false
+	unlabeledKinds := make([]string, 0, len(values))
+	allUnlabeled := true
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			unknown = true
+			notes = append(notes, "存在空白元数据项")
+			continue
+		}
+		field, extracted, labeled := metadataField(value)
+		if labeled {
+			allUnlabeled = false
+		} else {
+			unlabeledKinds = append(unlabeledKinds, field)
+		}
+		if field == "" || extracted == "" {
+			unknown = true
+			notes = append(notes, "无法识别元数据："+value)
+			continue
+		}
+		if _, exists := assignments[field]; exists {
+			duplicate = true
+			qualities[field] = model.ExtractionAmbiguous
+			notes = append(notes, "元数据字段重复："+field)
+			continue
+		}
+		assignments[field] = extracted
+		if labeled {
+			qualities[field] = model.ExtractionConfident
+		} else {
+			qualities[field] = model.ExtractionFallback
+		}
+	}
+	for _, field := range fields {
+		if _, ok := assignments[field]; !ok {
+			notes = append(notes, "元数据字段缺失："+field)
+		}
+	}
+	if unknown || duplicate {
+		return assignments, qualities, model.ExtractionAmbiguous, notes
+	}
+	allPresent := len(assignments) == len(fields)
+	if allPresent && allUnlabeled && sameStrings(unlabeledKinds, fields) {
+		for _, field := range fields {
+			qualities[field] = model.ExtractionConfident
+		}
+		return assignments, qualities, model.ExtractionConfident, notes
+	}
+	if allPresent {
+		for _, field := range fields {
+			if qualities[field] != model.ExtractionConfident {
+				return assignments, qualities, model.ExtractionFallback, notes
+			}
+		}
+		return assignments, qualities, model.ExtractionConfident, notes
+	}
+	return assignments, qualities, model.ExtractionFallback, notes
+}
+
+func metadataField(value string) (field, extracted string, labeled bool) {
+	if match := reMetadataLabel.FindStringSubmatch(value); len(match) > 2 {
+		field = fieldForMetadataLabel(match[1])
+		return field, strings.TrimSpace(match[2]), true
+	}
+	field = classifyMetadataValue(value)
+	return field, strings.TrimSpace(value), false
+}
+
+func fieldForMetadataLabel(label string) string {
+	label = strings.ToLower(strings.TrimSpace(label))
+	switch {
+	case strings.Contains(label, "薪"), strings.Contains(label, "工资"), strings.Contains(label, "待遇"), label == "salary":
+		return model.PositionFieldSalary
+	case strings.Contains(label, "地点"), strings.Contains(label, "城市"), strings.Contains(label, "所在地"), label == "location":
+		return model.PositionFieldLocation
+	case strings.Contains(label, "用工"), strings.Contains(label, "就业"), strings.Contains(label, "职位性质"), strings.Contains(label, "工作性质"), label == "类型", label == "employment":
+		return model.PositionFieldEmploymentType
+	case strings.Contains(label, "学历"), label == "degree":
+		return model.PositionFieldDegree
+	default:
+		return ""
+	}
+}
+
+func classifyMetadataValue(value string) string {
+	low := strings.ToLower(strings.TrimSpace(value))
+	switch {
+	case containsAnyText(low, "本科", "硕士", "博士", "研究生", "大专", "专科", "中专", "学历不限", "不限学历"):
+		return model.PositionFieldDegree
+	case containsAnyText(low, "全职", "兼职", "实习", "劳务", "校招", "社招", "合同制", "正式员工"):
+		return model.PositionFieldEmploymentType
+	case containsAnyText(low, "面议", "面谈", "年薪", "月薪", "薪资", "待遇") || (strings.ContainsAny(low, "元万k") && containsDigit(low)) || reSalaryValue.MatchString(low):
+		return model.PositionFieldSalary
+	case looksLikeLocation(low):
+		return model.PositionFieldLocation
+	default:
+		return ""
+	}
+}
+
+func looksLikeLocation(value string) bool {
+	if containsAnyText(value, "北京", "上海", "天津", "重庆", "沈阳", "大连", "长春", "哈尔滨", "南京", "杭州", "武汉", "广州", "深圳", "成都", "西安", "济南", "青岛") {
+		return true
+	}
+	return strings.HasSuffix(value, "省") || strings.HasSuffix(value, "市") || strings.HasSuffix(value, "自治区") || strings.HasSuffix(value, "州") || strings.HasSuffix(value, "区") || strings.HasSuffix(value, "县") || strings.HasSuffix(value, "路") || strings.HasSuffix(value, "园")
+}
+
+func containsAnyText(value string, terms ...string) bool {
+	for _, term := range terms {
+		if strings.Contains(value, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsDigit(value string) bool {
+	for _, r := range value {
+		if r >= '0' && r <= '9' {
+			return true
+		}
+	}
+	return false
+}
+
+func extractMajorCell(cells []string) (value string, quality model.ExtractionQuality, ambiguous bool, note string) {
+	candidates := make([]string, 0, len(cells))
+	marked := make([]string, 0, len(cells))
+	for _, cell := range cells {
+		cell = strings.TrimSpace(cell)
+		if cell == "" || isActionCell(cell) {
+			continue
+		}
+		candidates = append(candidates, cell)
+		if looksLikeMajorCell(cell) {
+			marked = append(marked, cell)
+		}
+	}
+	if len(marked) == 1 {
+		if len(candidates) > 1 {
+			return marked[0], model.ExtractionConfident, true, "专业列之外存在未识别单元格"
+		}
+		return marked[0], model.ExtractionConfident, false, ""
+	}
+	if len(marked) > 1 {
+		return "", model.ExtractionAmbiguous, true, "存在多个候选专业单元格"
+	}
+	if len(candidates) == 1 {
+		return candidates[0], model.ExtractionFallback, false, "专业列未带明确标签"
+	}
+	if len(candidates) > 1 {
+		return "", model.ExtractionAmbiguous, true, "无法在多个单元格中确认专业列"
+	}
+	return "", model.ExtractionAmbiguous, false, ""
+}
+
+func looksLikeMajorCell(value string) bool {
+	return containsAnyText(value, "需求专业", "专业要求", "专业：", "专业:", "〖", "【")
+}
+
+func isActionCell(value string) bool {
+	return containsAnyText(value, "投递", "申请", "操作")
+}
+
+func mergeExtractionQuality(left, right model.ExtractionQuality) model.ExtractionQuality {
+	if left == model.ExtractionAmbiguous || right == model.ExtractionAmbiguous {
+		return model.ExtractionAmbiguous
+	}
+	if left == model.ExtractionFallback || right == model.ExtractionFallback {
+		return model.ExtractionFallback
+	}
+	return model.ExtractionConfident
+}
+
+func uniqueNotes(notes []string) []string {
+	seen := make(map[string]struct{}, len(notes))
+	out := make([]string, 0, len(notes))
+	for _, note := range notes {
+		if note == "" {
+			continue
+		}
+		if _, ok := seen[note]; ok {
+			continue
+		}
+		seen[note] = struct{}{}
+		out = append(out, note)
+	}
+	return out
+}
+
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func extractListItems(fragment string) []string {

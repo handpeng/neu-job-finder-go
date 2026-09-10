@@ -124,11 +124,11 @@ func stableID(v model.JobView) string {
 func Score(a model.Announcement, pos model.Position, p model.Profile) model.JobView {
 	v := model.JobView{Announcement: a, Position: pos, Eligible: true}
 	generic := isGenericPosition(pos.Name, a.Company)
-	positionText := strings.Join([]string{pos.Name, pos.Salary, pos.Location, pos.EmploymentType, pos.Degree, pos.Majors}, " ")
+	positionText := positionText(pos)
 	positionSources := positionEvidence(positionText, pos, a.RawText, generic)
-	roleSources := positionEvidence(pos.Name, pos, a.RawText, generic)
-	majorSources := positionEvidence(pos.Majors, pos, a.RawText, generic)
-	citySources := append([]evidenceSource{}, positionEvidence(pos.Location+" "+pos.Name, pos, a.RawText, generic)...)
+	roleSources := positionEvidence(positionFieldValue(pos, model.PositionFieldName, pos.Name), pos, a.RawText, generic)
+	majorSources := positionEvidence(positionFieldValue(pos, model.PositionFieldMajors, pos.Majors), pos, a.RawText, generic)
+	citySources := append([]evidenceSource{}, positionEvidence(positionFieldValue(pos, model.PositionFieldLocation, pos.Location)+" "+positionFieldValue(pos, model.PositionFieldName, pos.Name), pos, a.RawText, generic)...)
 	if strings.TrimSpace(a.CommonText) != "" {
 		citySources = append(citySources, evidenceSource{text: a.CommonText, provenance: model.AnnouncementCommon, confidence: 1})
 	}
@@ -150,8 +150,8 @@ func Score(a model.Announcement, pos model.Position, p model.Profile) model.JobV
 		semanticField("核心技能", p.Skills, positionSources, 22),
 		semanticField("研究方向", p.Research, append(append([]evidenceSource{}, roleSources...), majorSources...), 18),
 		semanticField("专业", p.Major, majorSources, 13),
-		cityField(p.Cities, pos.Location, citySources, 12),
-		degreeField(p.Degree, pos.Degree, 10),
+		cityField(p.Cities, positionFieldValue(pos, model.PositionFieldLocation, pos.Location), citySources, 12),
+		degreeField(p.Degree, positionFieldValue(pos, model.PositionFieldDegree, pos.Degree), 10),
 		gradYearField(p.GraduationYear, positionEvidence("", pos, a.RawText, generic), a.CommonText),
 	}
 	active := 0
@@ -238,8 +238,32 @@ func Evaluate(a model.Announcement, pos model.Position, query model.BooleanQuery
 }
 
 func booleanEvidence(a model.Announcement, pos model.Position) []evidenceSource {
-	primary := strings.Join([]string{pos.Name, pos.Salary, pos.Location, pos.EmploymentType, pos.Degree, pos.Majors}, " ")
+	primary := positionText(pos)
 	return positionEvidence(primary, pos, a.RawText, isGenericPosition(pos.Name, a.Company))
+}
+
+func positionText(pos model.Position) string {
+	return strings.Join([]string{
+		positionFieldValue(pos, model.PositionFieldName, pos.Name),
+		positionFieldValue(pos, model.PositionFieldSalary, pos.Salary),
+		positionFieldValue(pos, model.PositionFieldLocation, pos.Location),
+		positionFieldValue(pos, model.PositionFieldEmploymentType, pos.EmploymentType),
+		positionFieldValue(pos, model.PositionFieldDegree, pos.Degree),
+		positionFieldValue(pos, model.PositionFieldMajors, pos.Majors),
+	}, " ")
+}
+
+func positionFieldValue(pos model.Position, field, value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	if quality, ok := pos.FieldQuality[field]; ok && quality == model.ExtractionAmbiguous {
+		return ""
+	}
+	if pos.ExtractionQuality == model.ExtractionAmbiguous && field != model.PositionFieldName {
+		return ""
+	}
+	return value
 }
 
 func legacyQuery(p model.Profile) model.BooleanQuery {
@@ -310,7 +334,17 @@ func evidenceTerms(hits []model.MatchEvidence) string {
 func positionEvidence(primary string, pos model.Position, fallback string, allowFallback bool) []evidenceSource {
 	sources := make([]evidenceSource, 0, len(pos.Evidence)+2)
 	if strings.TrimSpace(primary) != "" {
-		sources = append(sources, evidenceSource{text: primary, provenance: model.PositionPrimary, confidence: 1})
+		provenance := model.PositionPrimary
+		confidence := 1.0
+		switch pos.ExtractionQuality {
+		case model.ExtractionFallback:
+			provenance = model.PositionFallback
+			confidence = 0.75
+		case model.ExtractionAmbiguous:
+			provenance = model.PositionAmbiguous
+			confidence = 0.35
+		}
+		sources = append(sources, evidenceSource{text: primary, provenance: provenance, confidence: confidence})
 	}
 	for _, fragment := range pos.Evidence {
 		if strings.TrimSpace(fragment.Text) == "" {

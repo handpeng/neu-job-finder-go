@@ -44,6 +44,73 @@ func TestParseKnownShape(t *testing.T) {
 	if p.Name != "算法工程师" || p.Salary != "20000-30000" || p.Degree != "硕士" {
 		t.Fatalf("position=%#v", p)
 	}
+	if p.ExtractionQuality != model.ExtractionConfident || p.SourceText == "" || p.FieldQuality[model.PositionFieldDegree] != model.ExtractionConfident {
+		t.Fatalf("known-shape diagnostics=%#v", p)
+	}
+}
+
+func TestPositionExtractionMissingSalaryDoesNotShiftMetadata(t *testing.T) {
+	body := `<table><tr><td>01</td><td>算法工程师<ul><li>北京市海淀区</li><li>全职</li><li>硕士</li></ul></td><td>需求专业：人工智能、计算机科学</td><td>投递简历</td></tr></table>`
+	positions := extractPositions("901", body)
+	if len(positions) != 1 {
+		t.Fatalf("positions=%#v", positions)
+	}
+	p := positions[0]
+	if p.Salary != "" || p.Location != "北京市海淀区" || p.EmploymentType != "全职" || p.Degree != "硕士" {
+		t.Fatalf("missing salary shifted fields=%#v", p)
+	}
+	if p.ExtractionQuality != model.ExtractionFallback || p.FieldQuality[model.PositionFieldSalary] != model.ExtractionAmbiguous {
+		t.Fatalf("missing salary diagnostics=%#v", p)
+	}
+}
+
+func TestPositionExtractionLabelsHandleReorderedMetadata(t *testing.T) {
+	body := `<table><tr><td>01</td><td>研发工程师<ul><li>地点：上海</li><li>学历：硕士</li><li>工作性质：全职</li><li>薪资：15K-25K</li></ul></td><td>专业要求：材料科学</td><td>投递简历</td></tr></table>`
+	positions := extractPositions("902", body)
+	if len(positions) != 1 {
+		t.Fatalf("positions=%#v", positions)
+	}
+	p := positions[0]
+	if p.Location != "上海" || p.Degree != "硕士" || p.EmploymentType != "全职" || p.Salary != "15K-25K" || p.Majors != "专业要求：材料科学" {
+		t.Fatalf("reordered metadata=%#v", p)
+	}
+	if p.ExtractionQuality != model.ExtractionConfident || p.ExtractionNote != "" {
+		t.Fatalf("reordered diagnostics=%#v", p)
+	}
+}
+
+func TestPositionExtractionExtraMetadataIsAmbiguousButKeepsRecognizedFields(t *testing.T) {
+	body := `<table><tr><td>01</td><td>算法工程师<ul><li>20000-30000</li><li>沈阳</li><li>全职</li><li>硕士</li><li>3年以上工作经验</li></ul></td><td>需求专业：人工智能</td><td>投递简历</td></tr></table>`
+	positions := extractPositions("903", body)
+	if len(positions) != 1 {
+		t.Fatalf("positions=%#v", positions)
+	}
+	p := positions[0]
+	if p.Salary != "20000-30000" || p.Location != "沈阳" || p.EmploymentType != "全职" || p.Degree != "硕士" {
+		t.Fatalf("extra metadata shifted fields=%#v", p)
+	}
+	if p.ExtractionQuality != model.ExtractionAmbiguous || !strings.Contains(p.ExtractionNote, "无法识别元数据") || p.SourceText == "" {
+		t.Fatalf("extra metadata diagnostics=%#v", p)
+	}
+}
+
+func TestPositionExtractionSkipsMalformedRowsAndKeepsValidRows(t *testing.T) {
+	body := `<table><tr><td>broken</td></tr><tr><td>01</td><td>数据工程师<ul><li>北京</li><li>全职</li><li>本科</li></ul></td><td>需求专业：计算机科学</td></tr></table>`
+	positions := extractPositions("904", body)
+	if len(positions) != 1 || positions[0].Name != "数据工程师" {
+		t.Fatalf("mixed malformed/valid rows=%#v", positions)
+	}
+}
+
+func TestGenericAnnouncementPositionPreservesFallbackDiagnostics(t *testing.T) {
+	a := parseDetail("905", "https://example.test/campus/view/id/905", `<html><p>招聘公告正文：欢迎应聘人工智能相关岗位。</p></html>`)
+	if len(a.Positions) != 1 {
+		t.Fatalf("positions=%#v", a.Positions)
+	}
+	p := a.Positions[0]
+	if p.Name != "招聘公告（岗位见正文）" || p.ExtractionQuality != model.ExtractionFallback || p.SourceText == "" || p.FieldQuality[model.PositionFieldDegree] != model.ExtractionAmbiguous {
+		t.Fatalf("generic fallback=%#v", p)
+	}
 }
 
 func TestSchoolEmailFiltered(t *testing.T) {

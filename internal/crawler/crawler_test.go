@@ -132,6 +132,91 @@ func TestExpandEmbeddedContent(t *testing.T) {
 	}
 }
 
+func TestValidEmptyFirstPageReturnsSuccessfulEmptyDiscovery(t *testing.T) {
+	client := New(Config{BaseURL: "http://example.test", Delay: time.Nanosecond, MaxPages: 1})
+	detailRequested := false
+	var done ProgressEvent
+	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/campus/index/" {
+			return responseFor(req, validEmptyListPage()), nil
+		}
+		detailRequested = true
+		return responseFor(req, detailPage("unexpected", "2026-09-10")), nil
+	})
+
+	items, err := client.SyncProgress(context.Background(), SyncRequest{
+		StartDate: "2026-09-10",
+		EndDate:   "2026-09-10",
+	}, func(event ProgressEvent) error {
+		if event.Phase == "done" {
+			done = event
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 || detailRequested {
+		t.Fatalf("empty discovery items=%#v detail_requested=%v", items, detailRequested)
+	}
+	if done.PagesScanned != 1 || done.EntriesSeen != 0 || done.UniqueIDs != 0 || done.InRangeIDs != 0 || done.DetailsAttempted != 0 {
+		t.Fatalf("empty discovery counters=%+v", done)
+	}
+}
+
+func TestStableIDsWithoutDecodedListEntriesFailClosed(t *testing.T) {
+	client := New(Config{BaseURL: "http://example.test", Delay: time.Nanosecond, MaxPages: 1})
+	body := `<html><section id="content3387"><a href="/campus/view/id/777">公告链接</a></section></html>`
+	detailRequested := false
+	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/campus/index/" {
+			return responseFor(req, body), nil
+		}
+		detailRequested = true
+		return responseFor(req, detailPage("777", "2026-09-10")), nil
+	})
+
+	if got := extractInfoListEntries(body); len(got) != 0 {
+		t.Fatalf("decoded list entries=%#v", got)
+	}
+	if got := extractDetailIDs(body); len(got) != 1 || got[0] != "777" {
+		t.Fatalf("stable IDs=%v", got)
+	}
+	_, err := client.Sync(context.Background(), SyncRequest{StartDate: "2026-09-10", EndDate: "2026-09-10"})
+	if err == nil || !strings.Contains(err.Error(), "stable announcement IDs") {
+		t.Fatalf("expected stable-ID parser failure, got %v", err)
+	}
+	if detailRequested {
+		t.Fatal("parser failure must happen before detail fetching")
+	}
+}
+
+func TestMalformedEmbeddedContentFailsClosed(t *testing.T) {
+	corruptPayload := base64.StdEncoding.EncodeToString([]byte("not zlib data"))
+	body := fmt.Sprintf(`Base64.decode(unzip(%q).substr(0)).substr(0)`, corruptPayload)
+	client := New(Config{BaseURL: "http://example.test", Delay: time.Nanosecond, MaxPages: 1})
+	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return responseFor(req, body), nil
+	})
+
+	_, err := client.fetchList(context.Background(), 1, SyncRequest{})
+	if err == nil || !strings.Contains(err.Error(), "open embedded compressed data") {
+		t.Fatalf("expected embedded decompression failure, got %v", err)
+	}
+}
+
+func TestUnmarkedZeroEntryPageFailsClosed(t *testing.T) {
+	client := New(Config{BaseURL: "http://example.test", Delay: time.Nanosecond, MaxPages: 1})
+	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return responseFor(req, `<html><section id="content3387"></section></html>`), nil
+	})
+
+	_, err := client.Sync(context.Background(), SyncRequest{StartDate: "2026-09-10", EndDate: "2026-09-10"})
+	if err == nil || !strings.Contains(err.Error(), "source layout may have changed") {
+		t.Fatalf("expected unmarked empty parser failure, got %v", err)
+	}
+}
+
 func TestSyncCompressedSiteShape(t *testing.T) {
 	listContent := "<ul class='infoList'><li><a href='/campus/view/id/123'>测试科技有限公司</a></li><li>2026-09-09 10:00:00</li></ul>" +
 		"<ul class='infoList'><li><a href='/campus/view/id/122'>过期公司</a></li><li>2026-08-01 10:00:00</li></ul>"
@@ -816,6 +901,10 @@ func TestAnnouncementKeywordUsesLocalOR(t *testing.T) {
 
 func listPage(entries ...string) string {
 	return "<html>" + strings.Join(entries, "") + "</html>"
+}
+
+func validEmptyListPage() string {
+	return `<html><form class="css-form"><input name="starttime" value="2026-09-10"><input name="endtime" value="2026-09-10"></form><section id="content3387"><div class="empty-container"><img src="/static/common/i/no-data.png" alt=""><p>暂无数据</p></div></section></html>`
 }
 
 func listEntryHTML(id, date string) string {

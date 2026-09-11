@@ -43,6 +43,7 @@ var (
 	reEmail             = regexp.MustCompile(`(?i)[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}`)
 	reHref              = regexp.MustCompile(`(?is)<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>`)
 	reInfoList          = regexp.MustCompile(`(?is)<ul[^>]*class=["'][^"']*\binfoList\b[^"']*["'][^>]*>(.*?)</ul>`)
+	reEmptyList         = regexp.MustCompile(`(?is)<div[^>]*class=["'][^"']*\bempty-container\b[^"']*["'][^>]*>.*?<p[^>]*>\s*暂无数据\s*</p>.*?</div>`)
 	reEmbedded          = regexp.MustCompile(`(?is)Base64\.decode\s*\(\s*unzip\s*\(\s*["']([A-Za-z0-9+/=]+)["']\s*\)\s*\.substr\s*\(\s*(\d+)\s*\)\s*\)\s*\.substr\s*\(\s*(\d+)\s*\)`)
 	rePlainURL          = regexp.MustCompile(`(?i)https?://[^\s"'<>]+`)
 	reMetadataLabel     = regexp.MustCompile(`(?i)^\s*(薪资|薪酬|工资|待遇|salary|工作地点|工作地|地点|城市|所在地|location|用工形式|就业形式|职位性质|工作性质|类型|employment|学历|学历要求|最低学历|degree)\s*[：:]\s*(.*?)\s*$`)
@@ -329,9 +330,18 @@ func (c *Client) SyncProgress(ctx context.Context, req SyncRequest, progress Pro
 			return nil, fmt.Errorf("fetch list page %d: %w", page, err)
 		}
 		pageEntries := extractListEntries(body)
+		if len(extractInfoListEntries(body)) == 0 && len(extractDetailIDs(body)) > 0 {
+			return nil, fmt.Errorf("list page contained stable announcement IDs but no decoded list entries")
+		}
 		if len(pageEntries) == 0 {
 			if page == 1 {
-				return nil, fmt.Errorf("list page did not contain decoded announcements; the source layout may have changed")
+				if !isValidEmptyList(body) {
+					return nil, fmt.Errorf("list page did not contain decoded announcements; the source layout may have changed")
+				}
+				stats.PagesScanned = page
+				if err := emitProgress(progress, stats.progress(req.RunID, "discovering", page, 0, 0, nil, "列表页确认为空，没有可抓取公告")); err != nil {
+					return nil, err
+				}
 			}
 			break
 		}
@@ -679,6 +689,21 @@ func expandEmbeddedContent(body string) (string, error) {
 }
 
 func extractListEntries(body string) []listEntry {
+	out := extractInfoListEntries(body)
+	if len(out) > 0 {
+		return out
+	}
+	seen := make(map[string]bool)
+	for _, id := range extractDetailIDs(body) {
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, listEntry{ID: id})
+		}
+	}
+	return out
+}
+
+func extractInfoListEntries(body string) []listEntry {
 	blocks := reInfoList.FindAllStringSubmatch(body, -1)
 	out := make([]listEntry, 0, len(blocks))
 	for _, block := range blocks {
@@ -693,17 +718,13 @@ func extractListEntries(body string) []listEntry {
 		}
 		out = append(out, entry)
 	}
-	seen := make(map[string]bool)
-	if len(out) > 0 {
-		return out
-	}
-	for _, id := range extractDetailIDs(body) {
-		if !seen[id] {
-			seen[id] = true
-			out = append(out, listEntry{ID: id})
-		}
-	}
 	return out
+}
+
+func isValidEmptyList(body string) bool {
+	return len(extractDetailIDs(body)) == 0 &&
+		len(extractInfoListEntries(body)) == 0 &&
+		reEmptyList.MatchString(body)
 }
 
 func validateSyncRequest(req SyncRequest) error {

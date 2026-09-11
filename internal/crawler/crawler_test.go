@@ -217,6 +217,19 @@ func TestUnmarkedZeroEntryPageFailsClosed(t *testing.T) {
 	}
 }
 
+func TestEmptyMarkerWithMalformedListFailsClosed(t *testing.T) {
+	client := New(Config{BaseURL: "http://example.test", Delay: time.Nanosecond, MaxPages: 1})
+	body := `<html><div class="empty-container"><p>暂无数据</p></div><ul class="infoList"><li>malformed row</li></ul></html>`
+	client.http.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return responseFor(req, body), nil
+	})
+
+	_, err := client.Sync(context.Background(), SyncRequest{StartDate: "2026-09-10", EndDate: "2026-09-10"})
+	if err == nil || !strings.Contains(err.Error(), "source layout may have changed") {
+		t.Fatalf("expected malformed list parser failure, got %v", err)
+	}
+}
+
 func TestSyncCompressedSiteShape(t *testing.T) {
 	listContent := "<ul class='infoList'><li><a href='/campus/view/id/123'>测试科技有限公司</a></li><li>2026-09-09 10:00:00</li></ul>" +
 		"<ul class='infoList'><li><a href='/campus/view/id/122'>过期公司</a></li><li>2026-08-01 10:00:00</li></ul>"

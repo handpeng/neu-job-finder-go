@@ -723,6 +723,7 @@ func extractInfoListEntries(body string) []listEntry {
 
 func isValidEmptyList(body string) bool {
 	return len(extractDetailIDs(body)) == 0 &&
+		len(reInfoList.FindAllStringSubmatch(body, -1)) == 0 &&
 		len(extractInfoListEntries(body)) == 0 &&
 		reEmptyList.MatchString(body)
 }
